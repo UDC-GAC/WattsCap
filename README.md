@@ -1,13 +1,12 @@
-# ServerlessYARN
+# WattsCap
 
-This project provides a platform for the execution of Big Data workloads through Hadoop YARN in container-based clusters.
+This project provides a platform designed to restrict the power consumption of applications running in container-based environments.
 
-The platform provides a serverless environment that supports Singularity/Apptainer containers, scaling their allocated resources to fit them according to the usage in real time.
+The platform provides an environment that supports Singularity/Apptainer containers, scaling their CPU allocation to enforce a desired power budget.
 
-It is provided an automatic way of deploying the platform through IaC tools such as Ansible, as well as a web interface to easily manage the platform and execute Big Data workloads. The serverless platform may be deployed on an existing physical cluster, or on a virtual cluster for testing purposes.
+It is provided an automatic way of deploying the platform through IaC tools such as Ansible, as well as a web interface to easily manage the platform and execute workloads. The platform may be deployed on an existing physical cluster, or on a virtual cluster for testing purposes.
 
-### More information
-> &Oacute;scar Castellanos-Rodr&iacute;guez, Roberto R. Exp&oacute;sito, Jonatan Enes, Guillermo L. Taboada, Juan Touriño, [Serverless-like platform for container-based YARN clusters](https://doi.org/10.1016/j.future.2024.02.013). Future Generation Computer Systems, 155:256-271, February 2024.
+
 
 ## Getting Started
 
@@ -37,7 +36,7 @@ vagrant plugin install vagrant-vbguest
 > Only one cluster node (i.e. master node) needs to have Ansible installed and a passwordless SSH login to the remaining ones
 
 ### Quickstart
-The Serverless platform need to be installed and deployed on the master node (or "server" node), while the containers will be deployed on the remaining cluster nodes (workers or "hosts").
+The platform need to be installed and deployed on the master node (or "server" node), while the containers will be deployed on the remaining cluster nodes (workers or "hosts").
 
 - You can clone this repository and the required frameworks with
     ```
@@ -99,10 +98,9 @@ You will see a Home page with 5 subpages:
 
 ## Authors
 
-* **&Oacute;scar Castellanos-Rodr&iacute;guez** (https://gac.udc.es/~oscar.castellanos/)
+* **Tom&eacute; Maseda Dorado** (https://gac.udc.es/~tome/)
 * **Roberto R. Exp&oacute;sito** (https://gac.udc.es/~rober/)
 * **Jonatan Enes** (https://gac.udc.es/~jonatan/)
-* **Guillermo L. Taboada** (https://gac.udc.es/~gltaboada/)
 * **Juan Touriño** (https://gac.udc.es/~juan/)
 
 ## License
