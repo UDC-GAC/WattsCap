@@ -1,5 +1,5 @@
 ## Virtual mode: "yes" to deploy a vagrant virtual cluster; "no" if you want to use an existing cluster
-virtual_mode: yes
+virtual_mode: no
 
 ## Currently supported container engines: lxc, apptainer
 container_engine: apptainer
@@ -35,17 +35,17 @@ mongodb_port: 27017
 disk_capabilities: no # "yes" to allow disk capabilities, such as Logical Volumes creation
 disk_scaling: no # "yes" to allow disk bandwidth scaling (only relevant when using disk capabilities)
 # Power budgeting
-power_budgeting: no # "yes" to use power budgets, power will be accounted, restricted and shared among containers
-power_modelling: no # "yes" to use power models to get CPU Usage/Power proportionalities instead of using fixed values
-online_learning: no # "yes" to automatically retrain power models in real-time using OpenTSDB time series
-power_meter: "smartwatts" # rapl, smartwatts, selfwatts or stablewatts
+power_budgeting: yes # "yes" to use power budgets, power will be accounted, restricted and shared among containers
+power_modelling: yes # "yes" to use power models to get CPU Usage/Power proportionalities instead of using fixed values
+online_learning: yes # "yes" to automatically retrain power models in real-time using OpenTSDB time series
+power_meter: "rapl" # rapl, smartwatts, selfwatts or stablewatts
 
 ## WattWizard Config
 structures: "host"
 model_variables: "user_load,system_load"
-prediction_methods: "polyreg,sgdregressor"
+prediction_methods: "polyreg,sgdregressor,multisocket"
 modelled_cpu: "intel_xeon_silver_4216"
-train_files: "General"
+train_files: "General,Single_Core,hw_aware"
 guardian_default_model: "polyreg_General"
 
 ## InfluxDB Config
