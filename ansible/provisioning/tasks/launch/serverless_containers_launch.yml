@@ -1,4 +1,12 @@
 
+# The EnergyManager only enforces power budgets, so it can exclusively be used scale the containers with power_budgeting
+- name: Check the scaling service
+  assert:
+    that: "scaling_service | default('scaler') != 'energy_manager' or power_budgeting"
+    fail_msg: "scaling_service: energy_manager needs power_budgeting: yes (config/modules/05-power.yml)"
+    quiet: yes
+  tags: restart_services
+
 # Initializing State Database
 - name: Check existing tables in CouchDB
   shell: "curl -u admin:{{ couchdb_admin_pass }} -X GET http://127.0.0.1:{{ couchdb_port }}/_all_dbs"
@@ -14,7 +22,12 @@
     executable: /bin/bash
 
 - name: Initializing State Database - create other tables
-  when: "'events' not in couchdb_tables.stdout and 'requests' not in couchdb_tables.stdout and 'limits' not in couchdb_tables.stdout and 'structures' not in couchdb_tables.stdout"
+  when: "'events' not in couchdb_tables.stdout
+    or 'requests' not in couchdb_tables.stdout
+    or 'limits' not in couchdb_tables.stdout
+    or 'structures' not in couchdb_tables.stdout
+    or 'users' not in couchdb_tables.stdout
+    "
   shell: python3 conf/StateDatabase/other_tables.py
   args:
     chdir: "{{ serverless_containers_path }}"
@@ -27,15 +40,10 @@
     chdir: "{{ serverless_containers_path }}"
     executable: /bin/bash
 
-- name: Tmux session check
-  shell: tmux ls
-  register: tmux_output
-  ignore_errors: yes
-  tags: restart_services
-
 # Starting Services
+# EnergyManager replaces the Guardian, Scaler and ReBalancer
 - name: Starting Services
-  when: "item not in tmux_output.stdout"
+  when: "item not in tmux_sessions and (scaling_service | default('scaler') != 'energy_manager' or item not in ['guardian', 'scaler', 'rebalancer'])"
   shell: "bash scripts/services/{{ item }}/start_tmux.sh"
   args:
     chdir: "{{ serverless_containers_path }}"
@@ -52,18 +60,18 @@
   tags: restart_services
 
 - name: Starting Energy Services
-  when: "power_budgeting and item not in tmux_output.stdout"
+  when: "power_budgeting and item not in tmux_sessions"
   shell: "bash scripts/services/{{ item }}/start_tmux.sh"
   args:
     chdir: "{{ serverless_containers_path }}"
     executable: /bin/bash
   with_items:
-    - energy_manager
+    - "{{ 'energy_manager' if scaling_service | default('scaler') == 'energy_manager' else 'energy_controller' }}"
   tags: restart_services
 
 # Start WattWizard when power_modelling is "yes"
 - name: Starting WattWizard to create power models
-  when: "power_budgeting and power_modelling and 'watt_wizard' not in tmux_output.stdout"
+  when: "power_budgeting and power_modelling and 'watt_wizard' not in tmux_sessions"
   shell: "bash scripts/services/watt_wizard/start_tmux.sh"
   args:
     chdir: "{{ serverless_containers_path }}"
@@ -74,7 +82,7 @@
 - name: Start WattTrainer and deactivate
   block:
     - name: Starting WattTrainer to train power models in real time
-      when: "'watt_trainer' not in tmux_output.stdout"
+      when: "'watt_trainer' not in tmux_sessions"
       shell: "bash scripts/services/watt_trainer/start_tmux.sh"
       args:
         chdir: "{{ serverless_containers_path }}"
@@ -100,7 +108,7 @@
 
 ## Hosts
 - name: Initializing State Database - hosts
-  shell: "python3 scripts/stateDatabase/add_hosts_API.py {{ item }} '{{ resources | to_json | safe }}' {{ disks }} config/config.yml"
+  shell: "python3 {{ scripts_dir }}/state_database/add_hosts.py {{ item }} '{{ resources | to_json | safe }}' {{ disks }} {{ main_config }}"
   args:
     executable: /bin/bash
   vars:
@@ -111,7 +119,7 @@
 
 - name: Initializing State Database - add individual disks to hosts
   when: disk_capabilities and disk_scaling
-  shell: "python3 scripts/stateDatabase/add_disks_to_hosts.py {{ new_disks_dict }} config/config.yml"
+  shell: "python3 {{ scripts_dir }}/state_database/add_disks_to_hosts.py {{ new_disks_dict }} {{ main_config }}"
   args:
     executable: /bin/bash
   vars:
@@ -120,34 +128,18 @@
 
 - name: Initializing State Database - add disks to existing LV
   when: disk_capabilities and disk_scaling
-  shell: "python3 scripts/stateDatabase/update_host_disks_bw_db.py {{ item }} lvm {{ hostvars[item].disks.lvm.bw }} MB/s config/config.yml"
+  shell: "python3 {{ scripts_dir }}/state_database/update_host_disks_bw_db.py {{ item }} lvm {{ hostvars[item].disks.lvm.read_bw }} {{ hostvars[item].disks.lvm.write_bw }} MB/s {{ main_config }}"
   args:
     executable: /bin/bash
   with_items: "{{ nodes }}"
   tags: never, extend_lv
 
-## Disable scaler service before adding containers
-- name: Disabling Scaler service
-  shell: "bash scripts/orchestrator/Scaler/deactivate.sh"
-  args:
-    chdir: "{{ serverless_containers_path }}"
-    executable: /bin/bash
-  tags: never, start_containers, disable_scaler
-
 ## Containers
 - name: Initializing State Database - containers
-  shell: "python3 scripts/stateDatabase/add_containers_API_v3.py {{ containers_info | replace(' ','') | quote }} config/config.yml"
+  shell: "python3 {{ scripts_dir }}/state_database/add_containers.py {{ containers_info | replace(' ','') | quote }} {{ main_config }} {{ app_name if app_name is defined else '' }}"
   args:
     executable: /bin/bash
   tags: start_containers
-
-## Reactivate Scaler after adding containers
-- name: Activating Scaler service
-  shell: "bash scripts/orchestrator/Scaler/activate.sh"
-  args:
-    chdir: "{{ serverless_containers_path }}"
-    executable: /bin/bash
-  tags: never, start_containers, enable_scaler
 
 - name: Guardian - Set power model
   when: "power_budgeting and power_modelling"
@@ -158,6 +150,7 @@
 
 ## Activate Services
 - name: Activating Services
+  when: "scaling_service | default('scaler') != 'energy_manager' or item not in ['Guardian', 'Scaler', 'Rebalancer']"
   shell: "bash scripts/orchestrator/{{ item }}/activate.sh"
   args:
     chdir: "{{ serverless_containers_path }}"
@@ -169,4 +162,14 @@
     - Scaler
     - Refeeder
     - Rebalancer
+  tags: restart_services
+
+- name: Activating energy services
+  when: "power_budgeting"
+  shell: "bash scripts/orchestrator/{{ item }}/activate.sh"
+  args:
+    chdir: "{{ serverless_containers_path }}"
+    executable: /bin/bash
+  with_items:
+    - "{{ 'EnergyManager' if scaling_service | default('scaler') == 'energy_manager' else 'EnergyController' }}"
   tags: restart_services

@@ -13,7 +13,18 @@ guardian = dict(
         EVENT_TIMEOUT=60,
         WINDOW_DELAY=20,
         WINDOW_TIMELAPSE=10,
-        GUARDABLE_RESOURCES=["cpu"{% if disk_capabilities and disk_scaling %}, "disk"{% endif %}{% if power_budgeting %}, "energy"{% endif %}]
+        GUARDABLE_RESOURCES=[
+            "cpu",
+            # {%- if disk_capabilities and disk_scaling -%}
+            #
+            "disk_read", "disk_write",
+            # {%- endif -%}
+            # {%- if power_budgeting -%}
+            #
+            "energy"
+            # {%- endif -%}
+            #
+        ]
     )
 )
 
@@ -44,9 +55,23 @@ structures_snapshoter = dict(
     type="service",
     heartbeat="",
     config=dict(
+        POLLING_FREQUENCY=5,
         ACTIVE=False,
         DEBUG=True,
-        RESOURCES_PERSISTED=["cpu", "mem"{% if disk_capabilities and disk_scaling %}, "disk"{% endif %}{% if power_budgeting %}, "energy"{% endif %}]
+        STRUCTURES_PERSISTED=["application"],
+        RESOURCES_PERSISTED=[
+            "cpu",
+            "mem",
+            # {%- if disk_capabilities and disk_scaling -%}
+            #
+            "disk_read", "disk_write",
+            # {%- endif -%}
+            # {%- if power_budgeting -%}
+            #
+            "energy"
+            # {%- endif -%}
+            #
+        ]
     )
 )
 
@@ -57,7 +82,22 @@ refeeder = dict(
     config=dict(
         ACTIVE=False,
         DEBUG=True,
-        GENERATED_METRICS=["cpu", "mem"{% if disk_capabilities and disk_scaling %}, "disk"{% endif %}{% if power_budgeting %}, "energy"{% endif %}]
+        WINDOW_DELAY=20,
+        WINDOW_TIMELAPSE=10,
+        STRUCTURES_REFEEDED=["application"],
+        GENERATED_METRICS=[
+            "cpu",
+            "mem",
+            # {%- if disk_capabilities and disk_scaling -%}
+            #
+            "disk_read", "disk_write",
+            # {%- endif -%}
+            # {%- if power_budgeting -%}
+            #
+            "energy"
+            # {%- endif -%}
+            #
+        ]
     )
 )
 
@@ -66,50 +106,103 @@ sanity_checker = dict(
     type="service",
     heartbeat="",
     config=dict(
-        DELAY=30,
-        DEBUG=True
+        ACTIVE=False,
+        DEBUG=True,
+        DELAY=30
     )
 )
 
-rebalancer  = dict(
+rebalancer = dict(
     name="rebalancer",
     type="service",
     heartbeat="",
     config=dict(
+        ACTIVE=False,
         DEBUG=True,
-        RESOURCES_BALANCED=["cpu"{% if disk_capabilities and disk_scaling %}, "disk"{% endif %}],
-        STRUCTURES_BALANCED=["applications"],
+        DIFF_PERCENTAGE=0.40,
+        STOLEN_PERCENTAGE=0.40,
+        RESOURCES_BALANCED=[
+            "cpu",
+            # {%- if disk_capabilities and disk_scaling -%}
+            #
+            "disk_read", "disk_write",
+            # {%- endif -%}
+            #
+        ],
+        STRUCTURES_BALANCED=["container"],
         BALANCING_METHOD="pair_swapping",
+        CONTAINERS_SCOPE="application",
+        BALANCING_POLICY="rules",
+        ONLY_RUNNING=False,
         WINDOW_DELAY=10,
         WINDOW_TIMELAPSE=35
     )
 )
 
-{% if power_budgeting -%}
+# {% if power_budgeting -%}
 # Aditional services for power_budgeting
+energy_controller = dict(
+    name="energy_controller",
+    type="service",
+    heartbeat="",
+    config=dict(
+        EVENT_TIMEOUT=20,
+        CONTROL_POLICY="{{ 'model-boosted' if power_modelling else 'ppe-proportional' }}",
+        WINDOW_TIMELAPSE=10,
+        WINDOW_DELAY=0,
+        POLLING_FREQUENCY=5,
+        ACTIVE=False,
+        DEBUG=True
+    )
+)
+
+# {% if scaling_service | default('scaler') == 'energy_manager' -%}
+# EnergyManager
 energy_manager = dict(
     name="energy_manager",
     type="service",
     heartbeat="",
     config=dict(
-        POLLING_FREQUENCY=10,
+        POLLING_FREQUENCY=int("{{ sampling_frequency }}"),  # One sample per sampling period of the meters
+        MIN_ENERGY_POINTS=1,
+        MIN_CPU_POINTS=1,
+        METER_LAG=0,
+        REACTION_TIME=5 * int("{{ sampling_frequency }}"),  # The power error and its events cover the last 5 samples
+        ALLOWED_ERROR=0.05,                                 # Power within the budget +-ALLOWED_ERROR/2 is not scaled
+        CONTROLLER="{{ 'model-boosted' if power_modelling else 'ppe-proportional' }}",
+        EV_RATIO=10,
+        BUDGET_POLICY="direct",
+        POWER_ERROR="ewma-k",
+        EVENTS_SYSTEM="dynamic",
+        SCALE_UP_CHECK="{{ 'pressure' if container_metrics_feeder | default('atop') == 'lite' else 'boundary' }}",
+        PRESSURE_THRESHOLD=0.05,
+        POWER_MODEL="{{ guardian_default_model }}",
+        POWER_MODEL_ROUTING=True,
+        MODEL_RELIABILITY="low",
+        CPU_LAYOUT="scaler",
+        ACTIVE=False,
         DEBUG=True
     )
 )
 
-{% if online_learning -%}
+# {%- endif %}
+
+
+# {% if power_modelling and online_learning -%}
+# WattTrainer retrains the power models online
 watt_trainer = dict(
     name="watt_trainer",
     type="service",
     heartbeat="",
     config=dict(
-        WINDOW_TIMELAPSE={{ sampling_frequency }},
-        DEBUG=True
+        ACTIVE=False,
+        DEBUG=True,
+        WINDOW_TIMELAPSE=int("{{ sampling_frequency }}")
     )
 )
 
-{%- endif %}
-{%- endif %}
+# {%- endif %}
+# {%- endif %}
 
 if __name__ == "__main__":
     initializer_utils = couchdb_utils.CouchDBUtils()
@@ -128,10 +221,15 @@ if __name__ == "__main__":
         handler.add_service(sanity_checker)
         handler.add_service(rebalancer)
 
-        {% if power_budgeting -%}
+        # {% if power_budgeting -%}
         # Aditional services for power_budgeting
+        handler.add_service(energy_controller)
+        # {% if scaling_service | default('scaler') == 'energy_manager' -%}
+        # The EnergyManager instead of the Guardian, Scaler, ReBalancer and EnergyController
         handler.add_service(energy_manager)
-        {% if online_learning -%}
+        # {%- endif %}
+        # {% if power_modelling and online_learning -%}
+        # WattTrainer
         handler.add_service(watt_trainer)
-        {%- endif %}
-        {%- endif %}
+        # {%- endif %}
+        # {%- endif %}

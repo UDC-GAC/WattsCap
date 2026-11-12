@@ -1,0 +1,51 @@
+- name: Generate configuration file from modules
+  hosts: localhost
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    - es_udc_gac.smart_sharedfs
+
+  # TODO: avoid redundancy of the list of module files
+  # It is required to load the module files as vars in order to template variables
+  # e.g., to template the variable 'orchestrator_url' in 03-services.yml to the value of "{{ server_ip }}"
+  # templating all variables in the resulting config.yml file allows scripts to properly get the actual values
+  vars_files:
+      - paths.yml
+      - "{{ config_modules }}/01-general.yml"
+      - "{{ config_modules }}/02-hosts.yml"
+      - "{{ config_modules }}/03-services.yml"
+      - "{{ config_modules }}/04-disk.yml"
+      - "{{ config_modules }}/05-power.yml"
+      - "{{ config_modules }}/06-hdfs.yml"
+      - "{{ config_modules }}/07-containers.yml"
+      - "{{ config_modules }}/08-apps.yml"
+      - "{{ config_modules }}/09-plugins.yml"
+
+  vars:
+    modules:
+      - "{{ config_modules }}/01-general.yml"
+      - "{{ config_modules }}/02-hosts.yml"
+      - "{{ config_modules }}/03-services.yml"
+      - "{{ config_modules }}/04-disk.yml"
+      - "{{ config_modules }}/05-power.yml"
+      - "{{ config_modules }}/06-hdfs.yml"
+      - "{{ config_modules }}/07-containers.yml"
+      - "{{ config_modules }}/08-apps.yml"
+      - "{{ config_modules }}/09-plugins.yml"
+
+  tasks:
+    - name: Render and load each module as data
+      set_fact:
+        merged_config: >-
+          {{
+            merged_config | default({}) |
+            combine((lookup('template', item) | from_yaml | parse_types), recursive=True)
+          }}
+      loop: "{{ modules | sort }}" ## sort to keep the file order
+
+    - name: Write merged configuration to file
+      copy:
+        dest: "{{ main_config }}"
+        content: "{{ merged_config | to_nice_yaml(sort_keys=False) }}" ## disable the default alphabetical order of parameters

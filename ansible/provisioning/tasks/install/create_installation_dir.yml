@@ -1,17 +1,18 @@
-
-- name: get the username running the deploy
-  become: no
-  local_action: command whoami
-  register: username_on_the_host
-
 - name: Create installation directory
   file:
     path: "{{ installation_path }}"
     state: directory
-    owner: "{{ username_on_the_host.stdout_lines[0] }}"
+    owner: "{{ user_info.user_name }}"
 
-- name: Create tmp directory
+- name: Create directory to store asynchronous job IDs
+  delegate_to: localhost
+  file:
+    path: "{{ installation_path }}/async_jobs"
+    state: directory
+    owner: "{{ user_info.user_name }}"
+
+- name: Create temporary directory to store app temp files
   file:
     path: "{{ tmpdir }}"
     state: directory
-    owner: "{{ username_on_the_host.stdout_lines[0] }}"
+    owner: "{{ user_info.user_name }}"

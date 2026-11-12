@@ -1,0 +1,120 @@
+# Setup server
+- name: Launch services from server node
+  hosts: localhost
+  become: no
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    - es_udc_gac.smart_sharedfs
+  module_defaults:
+    synchronize: "{{ global_module_defaults.synchronize }}"
+    es_udc_gac.smart_sharedfs.synchronize: "{{ global_module_defaults.synchronize }}"
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  vars:
+    # change admin password both here and in config/debian_couchdb_conf.dat to effectively change it
+    ## TODO: centralize this password
+    - couchdb_admin_pass: admin
+
+  environment:
+    INSTALLATION_PATH: "{{ installation_path }}"
+    BDWATCHDOG_PATH: "{{ bdwatchdog_path }}"
+    SERVERLESS_PATH: "{{ serverless_containers_path }}"
+    PYTHONPATH: "{{ bdwatchdog_path }}:{{ serverless_containers_path }}"
+    CELERY_BROKER: "redis://127.0.0.1:6379/0"
+    CELERY_BACKEND: "redis://127.0.0.1:6379/0"
+
+  tasks:
+    - import_tasks: "{{ util_tasks }}/get_tmux_sessions.yml"
+      tags: restart_services, start_opentsdb, start_data_server
+
+    - import_tasks: "{{ launch_tasks }}/opentsdb_launch.yml"
+      when: deploy_local_opentsdb
+      tags: start_opentsdb
+
+    - import_tasks: "{{ launch_tasks }}/serverless_containers_launch.yml"
+      vars:
+        - nodes: "{{ host_list | split(',') if host_list is defined else groups['nodes'] }}"
+        - containers_info_str: >
+              {%- set containers_info=[] -%}
+              {%- for host in nodes -%}
+                {%- for container_name in hostvars[host].containers -%}
+                  {%- set container_info = dict() -%}
+                    {{ container_info.update({
+                      'container_name': container_name, 'host': host,
+                      'cpu_max': max_cpu_percentage_per_container, 'cpu_min': min_cpu_percentage_per_container,
+                      'mem_max': max_memory_per_container, 'mem_min': min_memory_per_container,
+                      'cpu_boundary': cpu_boundary, 'cpu_boundary_type': cpu_boundary_type,
+                      'mem_boundary': mem_boundary, 'mem_boundary_type': mem_boundary_type })
+                    }}
+                    {%- if disk_capabilities and disk_scaling and hostvars[host].disks|length > 0 -%}
+                      {%- if create_lvm -%}
+                        {%- set path = [hostvars[host].disks['lvm']['path'], bind_dir_name, container_name] | join('/') -%}
+                        {{ container_info.update( {'disk': 'lvm', 'disk_path': path} ) }}
+                      {%- else -%}
+                        {%- set first_disk = hostvars[host].disks | first -%}
+                        {%- set path = [hostvars[host].disks[first_disk]['path'], bind_dir_name, container_name] | join('/') -%}
+                        {{ container_info.update( {'disk': first_disk, 'disk_path': path} ) }}
+                      {%- endif -%}
+                      {{ container_info.update( {'disk_read_max': max_disk_read_bw_per_container, 'disk_read_min': min_disk_read_bw_per_container, 'disk_read_boundary': disk_read_boundary, 'disk_read_boundary_type': disk_read_boundary_type} ) }}
+                      {{ container_info.update( {'disk_write_max': max_disk_write_bw_per_container, 'disk_write_min': min_disk_write_bw_per_container, 'disk_write_boundary': disk_write_boundary, 'disk_write_boundary_type': disk_write_boundary_type} ) }}
+                    {%- endif -%}
+                    {%- if power_budgeting -%}
+                      {{ container_info.update({'energy_max': max_energy_per_container, 'energy_min': min_energy_per_container, 'energy_boundary': energy_boundary, 'energy_boundary_type': energy_boundary_type}) }}                      
+                    {%- endif -%}
+                    {{ containers_info.append(container_info) }}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ containers_info }} 
+        - containers_info: "{{ containers_info_str | replace('\n','') | replace(' ','') }}"
+
+    - import_tasks: "{{ launch_tasks }}/serverlessyarn_services_launch.yml"
+      tags: restart_services
+
+    - block:
+      - import_tasks: "{{ launch_tasks }}/mongodb_launch.yml"
+        tags: start_mongodb,start_power_meter
+
+      - import_tasks: "{{ launch_tasks }}/power_meter_launch.yml"
+        tags: start_power_meter
+      when: "power_budgeting"
+
+    - import_tasks: "{{ launch_tasks }}/data_server_launch.yml"
+      tags: start_data_server, restart_services
+      when: local_data_server
+
+# Setup nodes
+- name: Launch services from hosts
+  hosts: nodes
+  become: no
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    - es_udc_gac.smart_sharedfs
+  module_defaults:
+    synchronize: "{{ global_module_defaults.synchronize }}"
+    es_udc_gac.smart_sharedfs.synchronize: "{{ global_module_defaults.synchronize }}"
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  tasks:
+    - import_tasks: "{{ launch_tasks }}/power_sensor_launch.yml"
+      when: "power_budgeting"
+      tags: start_power_sensor
+
+    - import_tasks: "{{ launch_tasks }}/disk_atop_launch.yml"
+      when: disk_capabilities
+      tags: restart_services

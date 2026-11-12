@@ -1,0 +1,112 @@
+## General setup
+- name: General containers setup
+  tags: create_app
+  block:
+    - name: Create images directory
+      file:
+        path: "{{ installation_path }}/images"
+        state: directory
+
+    - name: Copy apptainer containers cgroup config
+      template:
+        src: "{{ templates_dir }}/{{ cgroups_file }}"
+        dest: "{{ installation_path }}/{{ cgroups_file }}"
+
+    - name: Copy app image to host
+      synchronize:
+        src: "{{ installed_app_directory }}/{{ image_file }}"
+        dest: "{{ installation_path }}/images/"
+        perms: true
+
+### Fix to add controllers to cgroups V2
+## Required only once to get the last "user.slice" on cgroups path (resets on reboot)
+## Required only is starting containers without sudo
+- name: Setup cgroups v2 controllers
+  when: cgroups_version == "v2"
+  block:
+    - name: Start dummy container
+      shell: "{{ singularity_command_alias }} instance start -C --apply-cgroups {{ cgroups_file }} {{ image_file }} dummy_cont"
+      args:
+        chdir: "{{ installation_path }}"
+        executable: /bin/bash
+
+    - name: Stop dummy container
+      shell: "{{ singularity_command_alias }} instance stop dummy_cont"
+      args:
+        executable: /bin/bash
+
+    - name: Add controllers to cgroups
+      become: yes
+      shell: "echo '+{{ item[0] }}' >> {{ item[1] }}/cgroup.subtree_control"
+      args:
+        chdir: "/sys/fs/cgroup/"
+        executable: /bin/bash
+      with_nested:
+        - [ 'cpu', 'cpuset', 'memory', 'io' ]
+        - [ 'user.slice', 
+            "user.slice/user-{{ user_info.user_id }}.slice",
+            "user.slice/user-{{ user_info.user_id }}.slice/user@{{ user_info.user_id }}.service",
+            "user.slice/user-{{ user_info.user_id }}.slice/user@{{ user_info.user_id }}.service/user.slice" ] ## last two paths do not actually need root permissions
+
+- name: Containers startup
+  tags: start_containers
+  block:
+    - name: Create directories to bind to containers
+      shell: "
+        {% for item in containers_info %}
+          {% if item.host == inventory_hostname %}
+            {% set container_bind_dir = item.disk_path if item.disk_path is defined else [bind_dir, item.container_name] | join('/') %}
+            mkdir -p {{ container_bind_dir }} &&
+          {% endif %}
+        {% endfor %}true"
+      args:
+        executable: /bin/bash
+
+    - name: Check containers status
+      shell: "{{ singularity_command_alias }} instance list -j"
+      args:
+        executable: /bin/bash
+      register: apptainer_list_output
+
+    - name: Start apptainer containers
+      shell: "
+        {% for item in containers_info %}
+          {% if item.host == inventory_hostname and item.container_name not in ((apptainer_list_output.stdout | from_json)['instances'] | default([]) | map(attribute='instance') | list) %}
+            {% set container_bind_dir = item.disk_path if item.disk_path is defined else [bind_dir, item.container_name] | join('/') %}
+            {{ singularity_command_alias }} instance start -C --net \ 
+              --network \
+              {% if not 'expose_ptp' in item -%}
+                {{ network }} \
+              {% else -%}
+                {{ exposed_ptp_network }} \
+              {% endif -%}
+            {% if 'portmap' in item -%}
+              --network-args {{ item.portmap }} \
+            {% endif -%}
+            --hostname {{ item.container_name }} --apply-cgroups {{ cgroups_file }} \
+            --bind {{ container_bind_dir }}:{{ bind_dir_on_container }} \
+            images/{{ image_file }} {{ item.container_name }} &&
+          {% endif  %}
+        {% endfor %}true"
+      args:
+        chdir: "{{ installation_path }}"
+        executable: /bin/bash
+      vars:
+        network: "{{ mode }}_{{ inventory_hostname }}{{ ',ptp' if mode == 'ipvlan' else '' }}"
+        exposed_ptp_network: "{{ 'ptp,' if mode == 'ipvlan' else '' }}{{ mode }}_{{ inventory_hostname }}"
+
+    - name: Setup host resolution in containers
+      shell: "
+        {% for item in containers_info %}
+          {% if item.host == inventory_hostname %}
+            {% set container_bind_dir = item.disk_path if item.disk_path is defined else [bind_dir, item.container_name] | join('/') %}
+            cp /etc/hosts {{ container_bind_dir }}/hosts \
+            && {{ singularity_command_alias }} exec instance://{{ item.container_name }} bash -c \
+            'echo {{ server_ip }} data_server >> /etc/hosts && echo {{ server_ip if deploy_local_opentsdb else opentsdb_url }} opentsdb >> /etc/hosts \
+            && cat {{ bind_dir_on_container }}/hosts >> /etc/hosts \
+            && rm {{ bind_dir_on_container }}/hosts' &&
+          {% endif  %}
+        {% endfor %}true"
+      args:
+        chdir: "{{ installation_path }}"
+        executable: /bin/bash

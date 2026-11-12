@@ -154,6 +154,7 @@ ul#tabs li {
 
 .modalDialog{
 	position: fixed;
+	text-align: left;
 	font-family: Arial, Helvetica, sans-serif;
 	top: 0;
 	right: 0;
@@ -283,6 +284,8 @@ a {
   line-height: 20px;
   cursor: pointer;
   transition: 0.3s;
+  background: transparent;
+  border: transparent;
 }
 
 /* When moving the mouse over the close button */
@@ -341,4 +344,26 @@ img {
 .data_table th.empty_header {
   background-color: white;
   border: none;
+}
+
+/* HDFS view */
+.data_table .hdfs_data {
+  text-transform: unset;
+}
+
+.data_table .hdfs_data::first-letter {
+  text-transform: unset;
+}
+
+.data_table .hdfs_actions {
+  background-color: white;
+  border: none;
+  text-align: center;
+  text-transform: unset;
+  color: unset;
+  font-weight: normal;
+}
+
+.fa {
+  font-size: 200%;
 }

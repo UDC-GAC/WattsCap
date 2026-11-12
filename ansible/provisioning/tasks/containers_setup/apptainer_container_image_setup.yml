@@ -1,84 +1,135 @@
 ## TODO: if base image is created but children images already exist, delete them and re-create them
-- name: Image creation
+- name: Image creation ({{ item }})
   delegate_to: localhost
   run_once: yes
-  tags: create_app
+  tags: create_app, setup_hdfs
   vars:
     ## item in this context is 'app_type'
-    - definition_file: "{{ definition_mapping[item] }}"
-    - image_file: "{{ image_mapping[item] }}"
-    - app_base_type: "{{ image_dependencies[item] }}"
-    - app_base_image_file: "{{ image_mapping[app_base_type] if app_base_type != '' }}" # will be used in the definition image templates
-    - app_directory: "apps/{{ app_dir if item == 'generic_app' else item }}"
+    - definition_file: "{{ app_mapping[item]['definition_file'] }}"
+    - image_file: "{{ app_mapping[item]['image'] }}"
+    - app_base_type: "{{ app_mapping[item]['image_dependency'] if 'image_dependency' in app_mapping[item] }}"
+    - app_base_image_file: "{{ app_mapping[app_base_type]['image'] if app_base_type is not none }}" # will be used in the definition image templates
+    - extra_files_directory: "{{ apps_dir }}/{{ app_mapping[item]['install_extra_files'] if 'install_extra_files' in app_mapping[item] }}" # directory on server with the app configuration, relative to 'ansible/provisioning'
+    - installed_app_directory: "{{ images_build_dir }}/{{ app_dir|basename if item == 'generic_app' else item }}" # installation path of app on server
   block:
-    - name: Check if app image already exists
+    - name: Check if app image already exists ({{ item }})
       stat:
-        path: "{{ installation_path }}/{{ app_directory }}/{{ image_file }}"
+        path: "{{ installed_app_directory }}/{{ image_file }}"
         get_checksum: false
         get_mime: false
         get_attributes: false
       register: stat_server_image_output
 
-    - name: Create app image
+    - name: Create app image ({{ item }})
       when: not stat_server_image_output.stat.exists
       block:
-        - name: Create app directory in server
+        - name: Create app directory in server ({{ item }})
           file:
-            path: "{{ installation_path }}/{{ app_directory }}"
+            path: "{{ installed_app_directory }}"
             state: directory
 
-        - name: Copy app definition file
+        - name: Copy app definition file ({{ item }})
           template:
-            src: "templates/apps/{{ definition_file }}"
-            dest: "{{ installation_path }}/{{ app_directory }}/{{ definition_file }}"
+            src: "{{ templates_dir }}/apps/{{ definition_file }}"
+            dest: "{{ installed_app_directory }}/{{ definition_file }}"
 
-        ## Copy other files
-        # Install script
-        - name: Copy app install script if applicable
-          when: install_script is defined and install_script != ''
+        ## Copy BDWatchdog source (Hadoop apps always use atop)
+        - name: Copy BDWatchdog source
+          when: container_metrics_feeder != "lite" or item == "hadoop_app"
+          synchronize:
+            src: "{{ externals_dir }}/BDWatchdog/"
+            dest: "{{ bdwatchdog_source_path }}"
+            recursive: true
+
+        - name: Copy BDWatchdog atop scripts to BDWatchdog source dir
+          when: container_metrics_feeder != "lite" or item == "hadoop_app"
           template:
-            src: "{{ app_directory }}/{{ install_script }}"
-            dest: "{{ installation_path }}/{{ app_directory }}/"
-
-        # Optional files directory
-        - name: Copy files from optional directory if applicable
-          when: files_dir is defined and files_dir != ''
-          block:
-            - name: Copy app optional files directory
-              copy:
-                src: "{{ app_directory }}/{{ files_dir }}"
-                dest: "{{ installation_path }}/{{ app_directory }}/"
-
-            - name: Find config files to template in the app directory
-              find:
-                paths: "{{ app_directory }}/{{ files_dir }}"
-                recurse: yes
-              register: found_config_files
-
-            - name: Process template for each config file
-              template:
-                src: "{{ file.path }}"
-                dest: "{{ installation_path }}/{{ app_directory }}/{{ files_dir }}/{{ file.path | regex_replace('^' + app_directory + '/' + files_dir, '') }}"
-              loop: "{{ found_config_files.files }}"
-              loop_control:
-                loop_var: file ## we need to change this inner loop variable to avoid collisions re-using the 'item' variable from the outer loop
-
-        # Hadoop files
-        - name: Copy necessary files for hadoop apps
-          when: "item == 'hadoop_app'"
-          copy:
-            src: "{{ app_directory }}/{{ file }}"
-            dest: "{{ installation_path }}/{{ app_directory }}/"
+            src: "{{ templates_dir }}/bdw_config/{{ file }}"
+            dest: "{{ bdwatchdog_source_path }}/MetricsFeeder/scripts/{{ file }}"
           with_items:
-            - setup.sh
-            - java_snitch.sh
-            - files_dir
+            - run_atop_stream.sh
+            - run_atop_stream_with_java_translation.sh
           loop_control:
             loop_var: file
 
-        - name: Build app image
-          shell: "{{ singularity_command_alias }} build {{ app_directory }}/{{ image_file }} {{ app_directory }}/{{ definition_file }}"
+        - name: Copy lite_feeder source to the base image directory (compiled in the image)
+          when: container_metrics_feeder == "lite" and item == "base"
+          copy:
+            src: "{{ services_dir }}/lite_feeder/lite_feeder.c"
+            dest: "{{ installed_app_directory }}/lite_feeder.c"
+
+        - name: Template lite_feeder scripts to the base image directory
+          when: container_metrics_feeder == "lite" and item == "base"
+          template:
+            src: "{{ services_dir }}/lite_feeder/{{ file }}"
+            dest: "{{ installed_app_directory }}/{{ file }}"
+          with_items:
+            - start.sh
+            - start_tmux.sh
+          loop_control:
+            loop_var: file
+
+        ## Copy other files
+        # Install script
+        - name: Copy app install script if applicable ({{ item }})
+          when: install_script is defined and install_script != '' and item == 'generic_app'
+          template:
+            src: "{{ extra_files_directory }}/{{ install_script }}"
+            dest: "{{ installed_app_directory }}/"
+
+        # Optional files directory
+        - name: Copy files from optional directory if applicable ({{ item }})
+          when: install_files is defined and install_files != '' and item == 'generic_app'
+          block:
+            - name: Copy app optional files directory ({{ item }})
+              copy: ## synchronize module would be faster, but it ignores the 'delegate_to' directive
+                src: "{{ extra_files_directory }}/{{ install_files }}"
+                dest: "{{ installed_app_directory }}/"
+
+            - name: Get valid install files for templating ({{ item }})
+              find:
+                paths: "{{ extra_files_directory }}/{{ install_files }}/"
+                recurse: yes
+                file_type: file
+                excludes: "*.jar,*.zip,*.tar,*.rar,*.gz,*.bz2,*.xz,*.7z,*.tgz"
+              register: files_to_template
+
+            - name: Process template for each valid file ({{ item }})
+              template:
+                src: "{{ file.path }}"
+                dest: "{{ installed_app_directory }}/{{ install_files | basename }}/{{ file.path | relpath(extra_files_directory + '/' + install_files + '/') }}"
+              loop: "{{ files_to_template.files }}"
+              loop_control:
+                loop_var: file ## we need to change this inner loop variable to avoid collisions re-using the 'item' variable from the outer loop
+                label: "{{ file.path }}" # label to display on output
+
+        # Hadoop files
+        - name: Copy necessary files for hadoop apps ({{ item }})
+          when: "item == 'hadoop_app'"
+          copy:
+            src: "{{ extra_files_directory }}/{{ file }}"
+            dest: "{{ installed_app_directory }}/"
+          with_items:
+            - setup.sh
+            - java_snitch.sh
+            - hadoop_files
+          loop_control:
+            loop_var: file
+
+        - name: Copy hadoop patch files ({{ item }})
+          when: "item == 'hadoop_app' and hdfs_replication_mode == 'hdfs_patch'"
+          copy:
+            src: "{{ extra_files_directory }}/{{ file }}"
+            dest: "{{ installed_app_directory }}/"
+          with_items:
+            - "hadoop-hdfs-{{ hadoop_version }}.jar"
+            - "hadoop-hdfs-client-{{ hadoop_version }}.jar"
+          loop_control:
+            loop_var: file
+
+        - name: Build app image ({{ item }})
+          shell: "{{ singularity_command_alias }} build {{ installed_app_directory }}/{{ image_file }} {{ installed_app_directory }}/{{ definition_file }}"
           args:
-            chdir: "{{ installation_path }}"
+            chdir: "{{ installed_app_directory }}/../.."
             executable: /bin/bash
-            creates: "{{ app_directory }}/{{ image_file }}"
+            creates: "{{ installed_app_directory }}/{{ image_file }}"

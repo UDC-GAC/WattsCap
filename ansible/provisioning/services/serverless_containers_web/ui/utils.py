@@ -1,12 +1,11 @@
-import requests
-import json
-from bs4 import BeautifulSoup
 
 DEFAULT_APP_VALUES = {
     "install_script": "install.sh",
     "start_script": "start.sh",
     "stop_script": "stop.sh",
-    "files_dir": "files_dir"
+    "install_files": "install_files",
+    "runtime_files": "runtime_files",
+    "output_dir": "output_dir",
 }
 
 DEFAULT_LIMIT_VALUES = {
@@ -18,24 +17,21 @@ DEFAULT_RESOURCE_VALUES = {
     "weight": 1
 }
 
-DEFAULT_HEADERS = {'Content-Type': 'application/json'}
+DEFAULT_HDFS_VALUES = {
+    "local_output": "/user/{username}",
+    "global_output": "/user/{username}"
+}
 
-def request_to_state_db(url, operation, error_message, data=None, headers=DEFAULT_HEADERS, session=None):
+DEFAULT_SERVICE_PARAMETERS = {
+    "lv_extension": {
+        "threshold": 0.2,
+        "polling_frequency": 5,
+        "timeout_events": 1
+    }
+}
 
-    if session: request_session = session
-    else: request_session = requests
+SUPPORTED_RESOURCES = {"cpu", "mem", "disk_read", "disk_write", "net", "energy"}
 
-    if operation == "put": http_operation = request_session.put
-    elif operation == "post": http_operation = request_session.post
-    elif operation == "delete": http_operation = request_session.delete
-    else: raise Exception("HTTP operation {0} not supported, use one of {1}".format(operation, ["put", "post", "delete"]))
+SUPPORTED_FRAMEWORKS = {"hadoop", "spark"}
 
-    if data: response = http_operation(url, data=json.dumps(data), headers=headers)
-    else: response = http_operation(url, headers=headers)
-
-    error = ""
-    if (response != "" and not response.ok):
-        soup = BeautifulSoup(response.text, features="html.parser")
-        error = "{0}: {1}".format(error_message, soup.get_text().strip())
-
-    return error, response
+EXCLUDED_VALUES_LABELS = {"cpu_cores", "alloc_ratio", "rebalanced"}

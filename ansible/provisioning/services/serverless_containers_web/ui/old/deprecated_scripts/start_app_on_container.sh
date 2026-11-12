@@ -1,0 +1,27 @@
+#!/bin/bash
+set -e
+HOST_NAME=$1
+CONTAINER=$2
+APP_NAME=$3
+APP_DIR=$4
+RUNTIME_FILES=$5
+INSTALL_SCRIPT=$6
+START_SCRIPT=$7
+STOP_SCRIPT=$8
+APP_JAR=$9
+CONTAINER_BIND_DIR=${10}
+
+scriptDir=$(dirname -- "$(readlink -f -- "$BASH_SOURCE")")
+source $scriptDir/access_playbooks_dir.sh
+
+unbuffer ansible-playbook manage_app_on_container.yml -i $INVENTORY -t start_app -l $HOST_NAME \
+    --extra-vars \
+        "container=$CONTAINER \
+        app_name=$APP_NAME \
+        app_dir=$APP_DIR \
+        runtime_files=$RUNTIME_FILES \
+        install_script=$INSTALL_SCRIPT \
+        start_script=$START_SCRIPT \
+        stop_script=$STOP_SCRIPT \
+        app_jar=$APP_JAR \
+        container_bind_dir=$CONTAINER_BIND_DIR"

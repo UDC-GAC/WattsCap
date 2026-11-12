@@ -1,25 +1,17 @@
 
 - name: Copy BDWatchdog
   synchronize:
-    src: BDWatchdog/
-    dest: "{{ item }}"
+    src: "{{ externals_dir }}/BDWatchdog/"
+    dest: "{{ bdwatchdog_path }}"
     recursive: true
-  with_items:
-    - ["{{ bdwatchdog_path }}", "{{ bdwatchdog_source_path }}"]
   tags: restart_services
-
-## get the user executing the playbook
-- name: get the username running the deploy
-  become: no
-  local_action: command whoami
-  register: username_on_the_host
 
 # TODO: read BDWatchdog_data path from BDWatchdog/deployment/config or viceversa
 - name: Create a BDWatchdog data directory
   file:
     path: "{{ installation_path }}/BDWatchdog_data"
     state: directory
-    owner: "{{ username_on_the_host.stdout_lines[0] }}"
+    owner: "{{ user_info.user_name }}"
     recurse: yes
 
 - name: Install BDWatchdog
@@ -35,7 +27,7 @@
   when: "virtual_mode"
   file:
     path: "{{ lookup('env', 'HOME') }}/.ssh/{{ item }}"
-    owner: "{{ username_on_the_host.stdout_lines[0] }}"
+    owner: "{{ user_info.user_name }}"
   with_items: ['known_hosts','id_rsa','id_rsa.pub']
 
 - name: Install just OpenTSDB
@@ -47,51 +39,35 @@
     creates: metrics/opentsdb/build/tsdb
 
 ## Stop tmux sessions created by root
-- name: Tmux session check
-  shell: tmux ls
-  register: tmux_output
-  ignore_errors: yes
+- import_tasks: "{{ util_tasks }}/get_tmux_sessions.yml"
 
 - name: Stop TIMESTAMPING Service
   shell: tmux kill-session -t EVE_TIMES
-  when: "'EVE_TIMES' in tmux_output.stdout"
+  when: "'EVE_TIMES' in tmux_sessions"
 
 - name: Stop OPENTSDB
   shell: bash stop.sh
-  when: "'OPENTSDB' in tmux_output.stdout"
+  when: "'OPENTSDB' in tmux_sessions"
   args:
     chdir: "{{ bdwatchdog_path }}/deployment/metrics"
     executable: /bin/bash
 
 - name: Change BDWatchdog dir owner
   file:
-    path: "{{ item }}"
+    path: "{{ bdwatchdog_path }}"
     state: directory
-    owner: "{{ username_on_the_host.stdout_lines[0] }}"
+    owner: "{{ user_info.user_name }}"
     recurse: yes
-  with_items:
-    - "{{ bdwatchdog_path }}"
-    - "{{ bdwatchdog_source_path }}"
 
 - name: Change BDWatchdog data dir owner
   file:
     path: "{{ installation_path }}/BDWatchdog_data"
     state: directory
-    owner: "{{ username_on_the_host.stdout_lines[0] }}"
+    owner: "{{ user_info.user_name }}"
     recurse: yes
 
 - name: Copy service aliases and port configuration to BDWatchdog dir
   template:
-    src: templates/bdw_config/services_config.yml
+    src: "{{ templates_dir }}/bdw_config/services_config.yml"
     dest: "{{ bdwatchdog_path }}/services_config.yml"
   tags: restart_services
-
-- name: Copy BDWatchdog atop scripts to BDWatchdog source dir
-  template:
-    src: "templates/bdw_config/{{ item }}"
-    dest: "{{ bdwatchdog_source_path }}/MetricsFeeder/scripts/{{ item }}"
-  with_items:
-    - run_atop_stream.sh
-    - run_atop_stream_with_java_translation.sh
-  tags: restart_services
-

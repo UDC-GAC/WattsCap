@@ -19,109 +19,212 @@
 
 <configuration>
 
-	<property>
-		<name>dfs.replication</name>
-		<value>3</value>
-	</property>
+    <property>
+        <name>dfs.namenode.rpc-address</name>
+        <value>{{ rm_container }}:8020</value>
+    </property>
 
-	<property>
-		<name>dfs.permissions.enable</name>
-		<value>false</value>
-	</property>
+    <property>
+        <name>dfs.namenode.rpc-bind-host</name>
+        <value>0.0.0.0</value>
+    </property>
 
-	<property>
-		<name>dfs.namenode.name.dir</name>
-		<value>{{ bind_dir_on_container }}/files_dir/data_dir/hdfs/namenode</value>
-	</property>
+    <!-- Nameservices -->
+        <!-- Self nameservice -->
+        <property>
+            <name>dfs.internal.nameservices</name>
+            <value>ns-{{ app_name | replace('_','-') }}</value>
+        </property>
 
-	<property>
-		<name>dfs.datanode.data.dir</name>
-		<value>{{ bind_dir_on_container }}/files_dir/data_dir/hdfs/datanode</value>
-	</property>
-<!--
-  <property>
-    <name>dfs.datanode.hostname</name>
-    <value>${HOSTNAME}</value>
-  </property>
--->
-  <property>
-    <name>dfs.blocksize</name>
-    <value>134217728</value>
-  </property>
+        <property>
+            <name>dfs.nameservice.id</name>
+            <value>nn1</value>
+        </property>
 
-  <property>
-    <name>dfs.namenode.handler.count</name>
-    <value>80</value>
-  </property>
-  <property>
-    <name>dfs.datanode.handler.count</name>
-    <value>20</value>
-  </property>
-  <property>
-    <name>dfs.namenode.service.handler.count</name>
-    <value>40</value>
-  </property>
-  <property>
-    <name>dfs.namenode.accesstime.precision</name>
-    <value>0</value>
-  </property>
+        <property>
+            <name>dfs.ha.namenodes.ns-{{ app_name | replace('_','-') }}</name>
+            <value>nn1</value>
+        </property>
 
-<!-- 
-  <property>
-    <name>dfs.domain.socket.path</name>
-    <value>/var/lib/hdfs/oscar.castellanos/dn_socket</value>
-  </property>
+        <property>
+            <name>dfs.namenode.rpc-address.ns-{{ app_name | replace('_','-') }}.nn1</name>
+            <value>{{ rm_container }}:8020</value>
+        </property>
 
-  <property>
-    <name>dfs.namenode.checkpoint.dir</name>
-    <value>/scratch/slurm/oscar.castellanos/24194/dfs/namesecondary,/scratch/ssd/slurm/oscar.castellanos/24194/dfs/namesecondary</value>
-  </property>
+        <property>
+            <name>dfs.namenode.rpc-bind-host.ns-{{ app_name | replace('_','-') }}.nn1</name>
+            <value>0.0.0.0</value>
+        </property>
 
-  <property>
-    <name>dfs.datanode.dns.interface</name>
-    <value>eth0</value>
-  </property>
--->
-  <!-- <property>
-    <name>dfs.datanode.dns.interface</name>
-    <value>eth0</value>
-  </property>
-  <property>
-    <name>dfs.client.local.interfaces</name>
-    <value>eth0</value>
-  </property> -->
-  <property>
-    <name>dfs.datanode.use.datanode.hostname</name>
-    <value>false</value>
-  </property>
-  <property>
-    <name>dfs.client.use.datanode.hostname</name>
-    <value>false</value>
-  </property>
-  <property>
-    <name>dfs.client-write-packet-size</name>
-    <value>65536</value>
-  </property>
-  <property>
-    <name>dfs.client.socket-timeout</name>
-    <value>60000</value>
-  </property>
-  <property>
-    <name>dfs.datanode.socket.write.timeout</name>
-    <value>60000</value>
-  </property>
-  <property>
-    <name>dfs.client.block.write.retries</name>
-    <value>5</value>
-  </property>
-  <property>
-    <name>dfs.client.block.write.locateFollowingBlock.retries</name>
-    <value>10</value>
-  </property>
-  <property>
-    <name>dfs.heartbeat.interval</name>
-    <value>5</value>
-  </property>
+        <!-- Other nameservices -->
+        {% if global_hdfs and namenode_container_name is defined %}
+
+            <!-- Local apps if global hdfs is enabled -->
+
+            <property>
+                <name>dfs.nameservices</name>
+                <value>ns-{{ app_name | replace('_','-') }},ns-{{ global_hdfs_app_name | replace('_','-') }}</value>
+            </property>
+
+            <property>
+                <name>dfs.ha.namenodes.ns-{{ global_hdfs_app_name | replace('_','-') }}</name>
+                <value>nn1</value>
+            </property>
+
+            <property>
+                <name>dfs.namenode.rpc-address.ns-{{ global_hdfs_app_name | replace('_','-') }}.nn1</name>
+                <value>{{ namenode_container_name }}:8020</value>
+            </property>
+
+        {% else %}
+
+            <!-- Global HDFS (or local apps if global hdfs is not enabled) -->
+            <property>
+                <name>dfs.nameservices</name>
+                <value>ns-{{ app_name | replace('_','-') }}</value>
+            </property>
+
+        {% endif %}
+
+    <!-- Replication  -->
+    {% if hdfs_replication_mode == 'hdfs_patch' %}
+        <property>
+            <name>dfs.namenode.replication.default.override</name>
+            <value>{{ hdfs_replication }}</value>
+        </property>
+    {% else %}
+        <property>
+            <name>dfs.replication</name>
+            <value>{{ hdfs_replication }}</value>
+        </property>
+    {% endif %}
+
+    <property>
+        <name>dfs.permissions.enabled</name>
+        <value>false</value>
+    </property>
+
+    <property>
+        <name>dfs.namenode.name.dir</name>
+        <value>{{ bind_dir_on_container }}/hadoop_files/data_dir/hdfs/namenode</value>
+    </property>
+
+    <property>
+        <name>dfs.datanode.data.dir</name>
+        <value>{{ bind_dir_on_container }}/hadoop_files/data_dir/hdfs/datanode</value>
+    </property>
+
+    <!-- <property>
+        <name>dfs.datanode.hostname</name>
+        <value>${HOSTNAME}</value>
+    </property> -->
+
+    <property>
+        <name>dfs.blocksize</name>
+        <value>134217728</value>
+    </property>
+
+    <property>
+        <name>dfs.namenode.handler.count</name>
+        <value>80</value>
+    </property>
+    <property>
+        <name>dfs.datanode.handler.count</name>
+        <value>20</value>
+    </property>
+    <property>
+        <name>dfs.namenode.service.handler.count</name>
+        <value>40</value>
+    </property>
+    <property>
+        <name>dfs.namenode.accesstime.precision</name>
+        <value>0</value>
+    </property>
+
+    <!--
+    <property>
+        <name>dfs.domain.socket.path</name>
+        <value>/var/lib/hdfs/oscar.castellanos/dn_socket</value>
+    </property>
+
+    <property>
+        <name>dfs.namenode.checkpoint.dir</name>
+        <value>/scratch/slurm/oscar.castellanos/24194/dfs/namesecondary,/scratch/ssd/slurm/oscar.castellanos/24194/dfs/namesecondary</value>
+    </property>
+
+    <property>
+        <name>dfs.datanode.dns.interface</name>
+        <value>eth0</value>
+    </property>
+    -->
+    <!-- <property>
+        <name>dfs.datanode.dns.interface</name>
+        <value>eth0</value>
+    </property>
+    <property>
+        <name>dfs.client.local.interfaces</name>
+        <value>eth0</value>
+    </property> -->
+
+    <property>
+        <name>dfs.datanode.use.datanode.hostname</name>
+        <value>false</value>
+    </property>
+    <property>
+        <name>dfs.client.use.datanode.hostname</name>
+        <value>false</value>
+    </property>
+    <property>
+        <name>dfs.client-write-packet-size</name>
+        <value>65536</value>
+    </property>
+    <property>
+        <name>dfs.client.socket-timeout</name>
+        <value>60000</value>
+    </property>
+    <property>
+        <name>dfs.datanode.socket.write.timeout</name>
+        <value>60000</value>
+    </property>
+    <property>
+        <name>dfs.client.block.write.retries</name>
+        <value>5</value>
+    </property>
+    <property>
+        <name>dfs.client.block.write.locateFollowingBlock.retries</name>
+        <value>10</value>
+    </property>
+    <property>
+        <name>dfs.heartbeat.interval</name>
+        <value>5</value>
+    </property>
+
+    <!-- Speed for replication process -->
+    <property>
+        <name>dfs.namenode.replication.work.multiplier.per.iteration</name>
+        <!-- Default = 2 -->
+        <value>10</value>
+    </property>
+
+    <property>
+        <name>dfs.namenode.replication.max-streams</name>
+        <!-- Default = 2 -->
+        <value>32</value>
+    </property>
+
+    <property>
+        <name>dfs.namenode.replication.max-streams-hard-limit</name>
+        <!-- Default = 4 -->
+        <value>32</value>
+    </property>
+
+    <!-- Required for RBF -->
+    <property>
+        <name>dfs.namenode.ip-proxy-users</name>
+        <!-- Default: empty -->
+        <!-- This allows the router to pass the client IP address to the NN when routing a request and thus leverage data locality -->
+        <value>{{ user_info.user_name }}</value>
+    </property>
 
 </configuration>
 

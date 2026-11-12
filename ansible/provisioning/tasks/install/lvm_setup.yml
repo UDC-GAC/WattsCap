@@ -47,7 +47,7 @@
                   shell: "sudo vgs {{ vg_name }}"
                   args:
                     executable: /bin/bash
-                  ignore_errors: yes
+                  failed_when: false
                   register: vgs_output
 
                 ## Allow extending VG and LV
@@ -61,7 +61,7 @@
                   shell: "sudo lvs {{ vg_name }}/{{ lv_name }}"
                   args:
                     executable: /bin/bash
-                  ignore_errors: yes
+                  failed_when: false
                   register: lvs_output
 
                 - name: Create a logical volume
@@ -79,11 +79,6 @@
           file:
             path: "{{ lv_path }}"
             state: directory
-
-        - name: get the username running the deploy
-          become: no
-          local_action: command whoami
-          register: username_on_the_host
 
         - name: Format and mount LV (virtual cluster)
           when: virtual_mode
@@ -108,7 +103,7 @@
             - name: Change lv path permissions
               file:
                 path: "{{ lv_path }}"
-                owner: "{{ username_on_the_host.stdout_lines[0] }}"
+                owner: "{{ user_info.user_name }}"
                 mode: '0755'
 
         - name: Format and mount LV (non-virtual cluster)
@@ -125,7 +120,7 @@
               shell: "/usr/sbin/blkid {{ lv_device_path }}"
               args:
                 executable: /bin/bash
-              ignore_errors: yes
+              failed_when: false
               register: blkid_output
 
             - name: Check if formatted volume has wrong fs type or bad superblocks
@@ -133,7 +128,7 @@
               shell: "sudo e2fsck -n {{ lv_device_path }}"
               args:
                 executable: /bin/bash
-              ignore_errors: yes
+              failed_when: false
               register: e2fsck_output
 
             - name: Format the ext4 filesystem
@@ -149,7 +144,7 @@
                 executable: /bin/bash
 
             - name: Change lv path permissions
-              shell: "sudo chown {{ username_on_the_host.stdout_lines[0] }} {{ lv_path }}"
+              shell: "sudo chown {{ user_info.user_name }} {{ lv_path }}"
               args:
                 executable: /bin/bash
       tags: create_lv
@@ -180,7 +175,7 @@
               shell: "sudo lvs {{ vg_name }}/{{ lv_name }}"
               args:
                 executable: /bin/bash
-              ignore_errors: yes
+              failed_when: false
               register: lvs_output
 
             - name: Remove logical volume
@@ -193,7 +188,7 @@
               shell: "sudo vgs {{ vg_name }}"
               args:
                 executable: /bin/bash
-              ignore_errors: yes
+              failed_when: false
               register: vgs_output
 
             - name: Remove volume group
@@ -230,11 +225,11 @@
 
             - name: Copy script
               copy:
-                src: scripts/add_disks_to_lv.sh
+                src: "{{ scripts_dir }}/system/add_disks_to_lv.sh"
                 dest: "{{ installation_path }}/"
 
             - name: Execute script to do all required steps
-              shell: "bash {{ installation_path }}/add_disks_to_lv.sh {{ vg_name }} {{ lv_name }} {{ new_disks_list }} {{ extra_disk }}"
+              shell: "bash {{ installation_path }}/add_disks_to_lv.sh {{ vg_name }} {{ lv_name }} {{ new_disks_list | replace(',',' ') }} {{ extra_disk }}"
               args:
                 executable: /bin/bash
 

@@ -1,0 +1,56 @@
+# HDFS
+global_hdfs: no
+
+# Directory in the server to store files to transfer/transferred to/from global HDFS
+global_hdfs_data_dir: $HOME/ssd/transfer
+global_hdfs_disk_name: "ssd_hdfs"
+
+# reserve server node to exclusively deploy master containers for global hdfs and regular hadoop apps.
+## only applies if 'server_as_host' parameter is enabled
+reserve_server_for_master: yes
+
+# Debug HDFS
+display_hdfs: yes ## display the HDFS filesystem on the 'hdfs' web view
+display_global_hdfs_app: no ## display the global hdfs app info on the 'hdfs' web view
+
+# used for HDFS frontend container to map the namenode port with a local port within the server node
+local_namenode_port: 55555
+namenode_port: 9870
+
+# replication factor
+default_hdfs_replication: 3
+global_hdfs_replication: "{{ default_hdfs_replication }}"
+local_hdfs_replication: 1
+
+# HDFS replication mode:
+## 'monitor': enables a background process that monitors the global HDFS and enforces its replication to 'global_hdfs_replication' (avoiding interference with running apps)
+## 'hdfs_patch': enables a patch for Hadoop container images that enforces the destination replication when writing without an explicit replication 
+### (e.g., if a local app does not declare a replication and writes to global HDFS, the resulting files will have the replication of the global NN instead of the default 3)
+hdfs_replication_mode: hdfs_patch
+
+# HDFS mode:
+## 'single': global HDFS + local app YARN clusters
+## 'open': global HDFS + local app HDFS+YARN clusters --> data transfers with global must be done using its address
+## 'isolated': global HDFS+YARN + local app HDFS+YARN clusters --> data transfers with global must be done via the interface. YARN in global is required for distcp operations
+## 'rbf': global HDFS + local app HDFS+YARN clusters --> data transfers with global are done through routing between clusters
+hdfs_mode: rbf
+
+# data size threshold when moving data between global and local HDFSs
+## if data size is lower than threshold  --> run a simple get/put data transfer
+## if data size is higher than threshold --> run distcp
+## by default the threshold is set to 2g to leverage the tmpfs of the containers and avoid disk I/O
+distcp_threshold: 2g
+
+# distcp executable to use when transfering more than 'distcp_threshold' of data between global and local HDFSs
+## 'hadoop_distcp': the regular distcp shipped with Hadoop
+## 'simple_distcp': a simpler distcp included in the platform, which runs a mapper per block and makes better use of data locality
+distcp_executable: simple_distcp
+
+# mode of assigning the 'blocksperchunk' parameter of distcp, that will modulate the number of mappers created
+## 'best-effort': it will try to assign the best distribution
+## 'distcp-default': 0 (do not slice files, create 1 mapper per file)
+## 'mapred-default': 1 (slice per every block, create 1 mapper per block)
+## 'nearest-multiple': try to assign a multiple for the maximum number of mappers;
+  ### this is a best-effort estimation, since it depends on the number of blocks of the selected path
+  ### an unbalanced block distribution in the files may lower the precision of the resulting distribution
+mappers_assignation: 'best-effort'

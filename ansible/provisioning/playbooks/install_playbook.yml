@@ -1,0 +1,148 @@
+# Setup server
+- name: Install requisites in server node
+  hosts: localhost
+  become: "{{ virtual_mode }}"
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    ## This gives priority to custom plugins, so calls to modules without their full names (FQCN)
+    ## (e.g., 'copy' instead of 'ansible.builtin.copy') will be resolved first by custom plugins
+    - es_udc_gac.smart_sharedfs
+  module_defaults:
+    synchronize: "{{ global_module_defaults.synchronize }}" ## this gets resolved to ansible.posix.synchronize, not custom plugins
+    es_udc_gac.smart_sharedfs.synchronize: "{{ global_module_defaults.synchronize }}"
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  environment:
+    HOME: "{{ lookup('env', 'HOME') }}"
+    INSTALLATION_PATH: "{{ installation_path }}"
+    OPENTSDB_LOG_PATH: "{{ opentsdb_log_path | quote }}"
+
+  tasks:
+    - import_tasks: "{{ util_tasks }}/get_user_ids.yml"
+      tags: always
+
+    - import_tasks: "{{ install_tasks }}/create_installation_dir.yml"
+    - import_tasks: "{{ install_tasks }}/time_sync.yml"
+      when: virtual_mode
+
+    - import_tasks: "{{ install_tasks }}/data_server_setup.yml"
+      tags: setup_data_server, restart_services
+      when: local_data_server
+
+    - import_tasks: "{{ install_tasks }}/apptainer_setup.yml"
+      when: "virtual_mode and container_engine == 'apptainer'"
+      tags: install_apptainer
+
+    - import_tasks: "{{ install_tasks }}/couchdb_setup.yml"
+    - import_tasks: "{{ install_tasks }}/bdwatchdog_setup.yml"
+      when: deploy_local_opentsdb
+
+    - import_tasks: "{{ install_tasks }}/serverless_containers_setup.yml"
+    - import_tasks: "{{ install_tasks }}/serverlessyarn_services_setup.yml"
+
+    - block:
+      - import_tasks: "{{ install_tasks }}/mongodb_setup.yml"
+        tags: setup_mongodb, setup_smartwatts, setup_selfwatts
+
+      - import_tasks: "{{ install_tasks }}/power_meter_setup.yml"
+        tags: setup_power_meter
+      when: "power_budgeting"
+
+    ## Force a refresh on the Ansible fact cache just in case the installation changed something relevant (e.g., mounts)
+    - name: Clear gathered facts
+      meta: clear_facts
+
+# Setup nodes
+- name: Install requisites in hosts
+  hosts: nodes
+  become: "{{ virtual_mode }}"
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    - es_udc_gac.smart_sharedfs
+  module_defaults:
+    synchronize: "{{ global_module_defaults.synchronize }}"
+    es_udc_gac.smart_sharedfs.synchronize: "{{ global_module_defaults.synchronize }}"
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  environment:
+    HOME: "{{ lookup('env', 'HOME') }}"
+    INSTALLATION_PATH: "{{ installation_path }}"
+
+  tasks:
+    - import_tasks: "{{ util_tasks }}/get_user_ids.yml"
+      tags: always
+
+    - import_tasks: "{{ install_tasks }}/create_installation_dir.yml"
+    - import_tasks: "{{ install_tasks }}/time_sync.yml"
+      when: virtual_mode
+
+    - import_tasks: "{{ install_tasks }}/apptainer_setup.yml"
+      when: "virtual_mode and container_engine == 'apptainer'"
+      tags: install_apptainer
+
+    - import_tasks: "{{ install_tasks }}/serverless_containers_setup.yml"
+    - import_tasks: "{{ install_tasks }}/metrics_feeder_setup.yml" # can be removed if an LXC container image is created
+      when: "container_engine == 'lxc'"
+
+    - import_tasks: "{{ install_tasks }}/lxd_setup.yml"
+      when: "virtual_mode and container_engine == 'lxc'"
+
+    - block:
+      - import_tasks: "{{ install_tasks }}/lvm_setup.yml"
+        when: create_lvm
+      - import_tasks: "{{ install_tasks }}/measure_disks_bandwidth.yml"
+        when: disk_capabilities and disk_scaling
+        tags: extend_lv, add_disks
+      when: disk_capabilities
+
+    - import_tasks: "{{ install_tasks }}/power_sensor_setup.yml"
+      when: "power_budgeting"
+      tags: setup_power_sensor
+
+# Setup nodes + server
+- name: Install requisites in nodes and server
+  hosts: platform_management,nodes
+  become: "{{ virtual_mode }}"
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    - es_udc_gac.smart_sharedfs
+  module_defaults:
+    synchronize: "{{ global_module_defaults.synchronize }}"
+    es_udc_gac.smart_sharedfs.synchronize: "{{ global_module_defaults.synchronize }}"
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  environment:
+    HOME: "{{ lookup('env', 'HOME') }}"
+    INSTALLATION_PATH: "{{ installation_path }}"
+
+  tasks:
+    - import_tasks: "{{ install_tasks }}/network_setup.yml"
+      when: "container_engine == 'apptainer'"
+
+    ## Force a refresh on the Ansible fact cache just in case the installation changed something relevant (e.g., mounts)
+    - name: Clear gathered facts
+      meta: clear_facts

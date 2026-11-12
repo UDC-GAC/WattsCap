@@ -1,11 +1,16 @@
 ## Installation path variables
 installation_path: "{{ lookup('env', 'HOME') }}/ServerlessYARN_install"
+data_server_path: "{{ installation_path }}/data_server"
 bdwatchdog_path: "{{ installation_path }}/BDWatchdog"
 bdwatchdog_source_path: "{{ installation_path }}/BDWatchdog_source"
 serverless_containers_path: "{{ installation_path }}/ServerlessContainers"
 apptainer_repo_path: "{{ installation_path }}/apptainer"
 lxd_key_path: "{{ serverless_containers_path }}"
-tmpdir: "{{ installation_path }}/tmpdir"
+app_output_data: "{{ installation_path }}/output_data"
+#app_output_data: /vagrant/ansible/provisioning/output_data # --> this is useful for testing in virtual_mode
+
+images_build_dir: "{{ installation_path }}/apps"
+images_dist_dir: "{{ installation_path }}/images"
 
 ## Power budgeting
 # MongoDB
@@ -20,6 +25,11 @@ sensor_reporting_path : /tmp/powerapi-sensor-reporting
 host_timestamps_dir: "{{ serverless_containers_path }}/conf/WattWizard/host"
 container_timestamps_dir: "{{ serverless_containers_path }}/conf/WattWizard/container"
 
+## Global HDFS
+global_hdfs_app_name: global_hdfs
+hdfs_frontend_container_name: hdfs-frontend
+data_dir_on_container: /opt/transfer
+
 ## Container bind directories variables
 default_bind_path: "{{ installation_path }}"
 bind_path: "{{ default_bind_path }}"
@@ -28,11 +38,20 @@ bind_dir: "{{ bind_path }}/{{ bind_dir_name }}"
 bind_dir_on_container: /opt/bind
 
 ## Framework versions
-hadoop_version: 3.3.6
+hadoop_version: 3.4.2
 spark_version: 3.4.3
+zookeeper_version: 3.9.4 # used for global HDFS rbf mode
+openjdk_version: 8
 
 ## Other
 couchdb_path: "{{ installation_path }}/couchdb"
+dns_path: "{{ installation_path }}/dns"
+dns_container_name: "dns-cont"
 opentsdb_log_path: "{{ bdwatchdog_path }}/opentsdb/log"
-web_interface_path: services/serverless_containers_web
 singularity_cgroups_group: singularity
+user_home_on_container: /var/tmp # /tmp and /var/tmp are the only non-read-only directories writable by any user
+
+## Temporary dirs
+ansible_async_dir: "{{ installation_path }}/async_jobs" # directory for Ansible to store async jobs. For some reason, Ansible is unable to write jobs in the default '$HOME/.ansible_async' dir when using the server as host
+tmpdir: "{{ installation_path }}/tmpdir"
+app_ssh_keys_dir: "{{ installation_path }}/app_keys"

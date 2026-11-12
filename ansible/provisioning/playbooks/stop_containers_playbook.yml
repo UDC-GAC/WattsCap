@@ -1,0 +1,36 @@
+# Stop containers from nodes
+- hosts: nodes
+  any_errors_fatal: yes
+  gather_facts: no
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  tasks:
+  - name: Stop apptainer containers from nodes
+    shell: "sudo {{ singularity_command_alias }} instance stop --all"
+    when: "container_engine == 'apptainer'"
+    args:
+      executable: /bin/bash
+    tags: stop_containers_nodes
+
+# Stop containers from server
+- hosts: localhost
+  any_errors_fatal: yes
+  gather_facts: no
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ main_config }}"
+
+  tasks:
+  - name: Stop apptainer containers from server
+    shell: "{{ singularity_command_alias }} instance stop --all"
+    when: "container_engine == 'apptainer'"
+    args:
+      executable: /bin/bash
+    tags: stop_containers_server
