@@ -20,7 +20,8 @@ WattsCap controls the power of each container through its CPU allocation, that i
 2. **Decision.** The EnergyManager compares the power of each container with its budget. When the power is out of a band around the budget (±2.5 % by default), it computes a new CPU allocation using the selected power capping method. This service determines both the CPU share and core allocation deemed appropriate to ensure that each container complies with its power budget, and sends this information to the NodeRescaler (or NodeRescalers) running on the hosts where the affected containers are running.
 3. **Actuation.** The NodeRescaler(s) of the host(s) apply the new allocation to the container(s) via cgroups.
 
-![High-level architecture overview of the platform](docs/images/architecture_overview.png)
+![High-level architecture overview of the platform (Light)](docs/images/architecture_overview_light.png#gh-light-mode-only)
+![High-level architecture overview of the platform (Dark)](docs/images/architecture_overview_dark.png#gh-dark-mode-only)
 
 The EnergyManager does not react to every fluctuation of the applications:
 
