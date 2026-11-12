@@ -1,5 +1,5 @@
 ## Virtual mode: "yes" to deploy a vagrant virtual cluster; "no" if you want to use an existing cluster
-virtual_mode: yes
+virtual_mode: no
 
 ## Currently supported container engines: lxc, apptainer
 container_engine: apptainer
@@ -10,8 +10,8 @@ singularity_command_alias: apptainer # singularity or apptainer (only relevant w
 cgroups_version: v1
 
 ## Sampling frequency (in seconds) of all the monitoring tools involved in the platform (BDWatchdog, PowerSender,...)
-sampling_frequency: 5
+sampling_frequency: 1
 
 ## Metrics feeder run inside the containers: "atop" (atop from BDWatchdog MetricsFeeder) or "lite" (services/lite_feeder)
 ## Hadoop/Spark apps keep atop, as they need the Java process name translation
-container_metrics_feeder: atop
+container_metrics_feeder: lite
