@@ -5,6 +5,9 @@ SINGULARITY_COMMAND_ALIAS: "{{ singularity_command_alias }}" # singularity or ap
 ## Cgroups version: v1 (Lecacy or Hybrid mode) or v2 (Unified mode)
 CGROUPS_VERSION: "{{ cgroups_version }}"
 
+# Service that scales the containers: 'scaler' or 'energy_manager' (special scaler for power capping)
+SCALING_SERVICE: "{{ scaling_service | default('scaler') }}"
+
 ### Only used by server node
 ## Orchestrator
 ORCHESTRATOR_URL: "127.0.0.1"
@@ -18,6 +21,6 @@ WATTWIZARD_PORT: "{{ wattwizard_port }}"
 COUCHDB_URL: "127.0.0.1"
 COUCHDB_PORT: "{{ couchdb_port }}"
 
-# OpenTSDB:
-OPENTSDB_URL: "127.0.0.1"
+# OpenTSDB: local DB if deploy_local_opentsdb: yes, opentsdb_url otherwise
+OPENTSDB_URL: "{{ '127.0.0.1' if deploy_local_opentsdb else opentsdb_url }}"
 OPENTSDB_PORT: "{{ opentsdb_port }}"

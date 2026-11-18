@@ -1,0 +1,20 @@
+Bootstrap: localimage
+From: {{ installed_app_directory }}/../{{ app_base_type }}/{{ app_base_image_file }}
+
+%post
+    apt-get -y update
+    apt-get install -y socat
+
+    # Clean non-necessary files from parent images
+    cd /opt
+    rm -r BDWatchdog
+    rm -r hadoop_files
+    rm java_snitch.sh
+
+%environment
+    ## reset HADOOP_CONF_DIR env variable
+    export HADOOP_CONF_DIR=""
+
+%startscript
+    ENVFILE="/.singularity.d/env/90-environment.sh"
+    su - {{ user_info.user_name }} -c "source $ENVFILE && bash /opt/setup.sh"

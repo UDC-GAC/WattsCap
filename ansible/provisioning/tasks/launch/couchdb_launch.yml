@@ -13,14 +13,16 @@
 
         - name: Copy CouchDB definition file and configuration files
           template:
-            src: "templates/couchdb/{{ item }}"
+            src: "{{ templates_dir }}/couchdb/{{ item }}"
             dest: "{{ couchdb_path }}/{{ item }}"
           with_items:
             - "{{ definition_file }}"
             - debian_couchdb_conf.dat
             - local.ini
+            - logrotate-couchdb
+            - logrotate-loop.sh
 
-        - name: Build image
+        - name: Build image (couchdb)
           shell: "{{ singularity_command_alias }} build {{ image_file }} {{ definition_file }}"
           args:
             chdir: "{{ couchdb_path }}"

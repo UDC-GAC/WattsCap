@@ -1,0 +1,23 @@
+# Power budgeting
+power_budgeting: yes # "yes" to use power budgets, power will be accounted, restricted and shared among containers
+power_modelling: yes # "yes" to use power models to get CPU Usage/Power proportionalities instead of using fixed values
+online_learning: no # "yes" to automatically retrain power models in real-time using OpenTSDB time series
+power_meter: "stablewatts" # rapl, smartwatts, selfwatts or stablewatts
+
+## Scaling service: service of ServerlessContainers that scales the containers
+# The EnergyManager needs power_budgeting active, this service replaces Guardian, Scaler, ReBalancer and EnergyController
+scaling_service: "energy_manager" # 'scaler' or 'energy_manager'
+
+## WattWizard Config
+structures: "host"
+model_variables: "user_load,system_load"
+prediction_methods: "polyreg"
+modelled_cpu: "intel_xeon_silver_4216_nc_2026"
+train_files: "General,Single_Core,Group_PP_LL,Group_1P_2L,Group_P_and_L,Spread_PP_LL,Spread_P_and_L,Group_P,Spread_P"
+guardian_default_model: "polyreg_General"
+
+## InfluxDB Config
+influxdb_host: "montoxo.des.udc.es"
+influxdb_bucket: "compute2"
+influxdb_token: "MyToken"
+influxdb_org: "MyOrg"

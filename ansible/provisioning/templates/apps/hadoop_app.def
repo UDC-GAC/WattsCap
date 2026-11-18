@@ -1,20 +1,30 @@
 Bootstrap: localimage
-From: apps/{{ app_base_type }}/{{ app_base_image_file }}
+From: {{ installed_app_directory }}/../{{ app_base_type }}/{{ app_base_image_file }}
 
 %files
-    {{ app_directory }}/files_dir /opt/files_dir
-    {{ app_directory }}/setup.sh /opt/setup.sh
-    {{ app_directory }}/java_snitch.sh /opt/java_snitch.sh
-
-    # To avoid repeating hadoop download while debugging
-    #"{{ installation_path }}/apps/hadoop_app/hadoop-{{ hadoop_version }}.tar.gz" /opt/hadoop-{{ hadoop_version }}.tar.gz
+{% if container_metrics_feeder == 'lite' %}
+    # The base image has lite_feeder instead of atop: Hadoop keeps atop + MetricsFeeder (Java process names translation)
+    "{{ bdwatchdog_source_path }}" /opt/BDWatchdog
+{% endif %}
+    {{ installed_app_directory }}/hadoop_files /opt/hadoop_files
+    {{ installed_app_directory }}/setup.sh /opt/setup.sh
+    {{ installed_app_directory }}/java_snitch.sh /opt/java_snitch.sh
+    {% if hdfs_replication_mode == 'hdfs_patch' -%}
+    {{ installed_app_directory }}/hadoop-hdfs-{{ hadoop_version }}.jar /opt/hadoop-hdfs-{{ hadoop_version }}.jar
+    {{ installed_app_directory }}/hadoop-hdfs-client-{{ hadoop_version }}.jar /opt/hadoop-hdfs-client-{{ hadoop_version }}.jar
+    {% endif %}
 
 %post
-    # Install basic software and Java
+    ############################ Install basic software ######################################
     export DEBIAN_FRONTEND=noninteractive
     apt-get -y update
-    apt-get install -y wget gettext-base openssh-client openssh-server
-    apt-get install -y openjdk-8-jdk
+    apt-get install -y curl wget gettext-base
+{% if container_metrics_feeder == 'lite' %}
+# If base image dis not install atop, hadoop image installs it
+{% include '../bdw_config/atop_metrics_feeder.j2' %}
+
+    cd /opt
+{% endif %}
 
     # Trying to setup firewall (iptables prevent hadoop cluster from working)
     #apt-get remove -y iptables
@@ -26,46 +36,120 @@ From: apps/{{ app_base_type }}/{{ app_base_image_file }}
     #modprobe /lib/modules/$(uname -r)/kernel/net/ipv4/netfilter/iptable_filter.ko
     #ufw --force enable
 
-    export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
-
-    # Setup SSH
+    ##################################### SSH ###############################################
+    apt-get install -y openssh-client openssh-server
     mkdir /run/sshd
     chmod 0711 /run/sshd
 
-    # Setup hadoop
+    ##################################### Java ##############################################
+    apt-get install -y openjdk-{{ openjdk_version }}-jdk
+    export JAVA_HOME=/usr/lib/jvm/java-{{ openjdk_version }}-openjdk-amd64
+
+    ##################################### Hadoop ############################################
     cd /opt
-    export HADOOP_CONF_DIR=/opt/files_dir/hadoop_conf
-    export DATA_DIR="{{ bind_dir_on_container }}/files_dir/data_dir"
-    mkdir -p files_dir/data_dir
-    wget https://archive.apache.org/dist/hadoop/core/hadoop-{{ hadoop_version }}/hadoop-{{ hadoop_version }}.tar.gz
-    mkdir hadoop && tar xf hadoop-{{ hadoop_version }}.tar.gz -C hadoop --strip-components 1
+    export HADOOP_CONF_DIR=/opt/hadoop_files/hadoop_conf
+    export DATA_DIR="{{ bind_dir_on_container }}/hadoop_files/data_dir"
+    mkdir -p hadoop_files/data_dir
+
+    ## Download and uncompress
+    hadoop_download_file=hadoop-{{ hadoop_version }}.tar.gz
+    {% if local_data_server -%}
+    ### Take advantage of the local data server to speed up the download
+    wget -O $hadoop_download_file "http://${DATA_SERVER_IP}:${DATA_SERVER_PORT}/$hadoop_download_file"
+    {%- else -%}
+    ### Take advantage of the parallel script included in BDWatchdog to speed up the download
+    parallel_script_path=/opt/BDWatchdog/deployment/metrics/parallel_curl.sh
+    number_of_chunks=$(( $(nproc) * 2 ))
+    hadoop_download_dir=https://archive.apache.org/dist/hadoop/core/hadoop-{{ hadoop_version }}
+    bash $parallel_script_path $hadoop_download_dir/$hadoop_download_file $hadoop_download_file "${number_of_chunks}"
+    {%- endif %}
+
+    mkdir hadoop && tar xf $hadoop_download_file -C hadoop --strip-components 1 && rm $hadoop_download_file
+
+    ## PATCH hadoop
+    {% if hdfs_replication_mode == 'hdfs_patch' -%}
+    mv hadoop-hdfs-{{ hadoop_version }}.jar hadoop/share/hadoop/hdfs/
+    mv hadoop-hdfs-client-{{ hadoop_version }}.jar hadoop/share/hadoop/hdfs/
+    {%- endif %}
+
     chown -R $(whoami):$(whoami) hadoop
-    cp files_dir/config/format_filesystem.sh hadoop
+
+    ## Setup format script and default configuration files
+    cp hadoop_files/config/format_filesystem.sh hadoop
     mkdir -p $HADOOP_CONF_DIR && cp -r hadoop/etc/hadoop/* $HADOOP_CONF_DIR/
-    envsubst < files_dir/config/hdfs-site.xml > $HADOOP_CONF_DIR/hdfs-site.xml
-    cp files_dir/config/core-site.xml $HADOOP_CONF_DIR/core-site.xml
-    cp files_dir/config/mapred-site.xml $HADOOP_CONF_DIR/mapred-site.xml
-    cp files_dir/config/yarn-site.xml $HADOOP_CONF_DIR/yarn-site.xml
-    cp files_dir/config/workers $HADOOP_CONF_DIR/workers
+    envsubst < hadoop_files/config/hdfs-site.xml > $HADOOP_CONF_DIR/hdfs-site.xml
+    cp hadoop_files/config/core-site.xml $HADOOP_CONF_DIR/core-site.xml
+    cp hadoop_files/config/mapred-site.xml $HADOOP_CONF_DIR/mapred-site.xml
+    cp hadoop_files/config/yarn-site.xml $HADOOP_CONF_DIR/yarn-site.xml
+    cp hadoop_files/config/workers $HADOOP_CONF_DIR/workers
+
+    ## Set regular user as owner of required files
+    chown -R {{ user_info.user_name }} hadoop_files
+
+    ##################################### Zookeper ##########################################
+    ## Zookeeper is required for global HDFS rbf mode
+    cd /opt
+    zookeeper_download_file=apache-zookeeper-{{ zookeeper_version }}-bin.tar.gz
+    zookeeper_download_dir=https://dlcdn.apache.org/zookeeper/zookeeper-{{ zookeeper_version }}
+    {% if local_data_server -%}
+    ### Take advantage of the local data server to speed up the download
+    wget -O $zookeeper_download_file "http://${DATA_SERVER_IP}:${DATA_SERVER_PORT}/$zookeeper_download_file"
+    {%- else -%}
+    zookeeper_download_dir=https://archive.apache.org/dist/zookeeper/zookeeper-{{ zookeeper_version }}
+    # Use simple wget since the file to download is lightweight
+    wget -O $zookeeper_download_file $zookeeper_download_dir/$zookeeper_download_file
+    {%- endif %}
+
+    mkdir zookeeper && tar xf $zookeeper_download_file -C zookeeper --strip-components 1 && rm $zookeeper_download_file
+    chown -R $(whoami):$(whoami) zookeeper
+
+    ## Setup config
+    zoo_conf_file=zookeeper/conf/zoo.cfg
+    touch $zoo_conf_file
+    for line in \
+        "tickTime=2000" \
+        "dataDir={{ user_home_on_container }}/zookeeper/data" \
+        "clientPort=2181" \
+        "initLimit=5" \
+        "syncLimit=2"; do
+        echo "$line" >> "$zoo_conf_file"
+    done
 
 %environment
-    export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
-    export JAVA_MAPPINGS_FOLDER_PATH="{{ bind_dir_on_container }}/files_dir/java_mappings"
+    # Java
+    export JAVA_HOME=/usr/lib/jvm/java-{{ openjdk_version }}-openjdk-amd64
+    export JAVA_MAPPINGS_FOLDER_PATH="{{ bind_dir_on_container }}/hadoop_files/java_mappings"
+
     # Hadoop
-    export DATA_DIR="{{ bind_dir_on_container }}/files_dir/data_dir"
+    export DATA_DIR="{{ bind_dir_on_container }}/hadoop_files/data_dir"
     export HADOOP_HOME=/opt/hadoop
-    export HADOOP_CONF_DIR="{{ bind_dir_on_container }}/files_dir/hadoop_conf"
-    #export YARN_CONF_DIR=$HADOOP_CONF_DIR
+    export HADOOP_CONF_DIR="{{ bind_dir_on_container }}/hadoop_files/hadoop_conf"
     export HADOOP_LOG_DIR="{{ bind_dir_on_container }}/hadoop_logs"
+
+    # YARN (if conf and log dir are undefined they will default to the hadoop ones)
+    #export YARN_CONF_DIR=$HADOOP_CONF_DIR
     #export YARN_LOG_DIR=$HADOOP_LOG_DIR
-    ## Hadoop users (hadoop 3.3.5)
+
+    ## Hadoop and YARN users (required for hadoop 3.3.5+)
     export HDFS_NAMENODE_USER=$(whoami)
     export HDFS_DATANODE_USER=$(whoami)
     export HDFS_SECONDARYNAMENODE_USER=$(whoami)
     export YARN_RESOURCEMANAGER_USER=$(whoami)
     export YARN_NODEMANAGER_USER=$(whoami)
 
+    # Zookeeper
+    export ZOO_LOG_DIR="{{ user_home_on_container }}/zookeeper/logs"
+
 %startscript
-    #cd /opt/BDWatchdog/MetricsFeeder && bash scripts/run_atop_stream_tmux.sh && \
-    cd /opt/BDWatchdog/MetricsFeeder && bash scripts/run_atop_stream_with_java_translation.sh && bash /opt/java_snitch.sh && \
+    ## File with the variables defined in the %environment section that will be read by the "setup.sh" script
+    ENVFILE="/.singularity.d/env/90-environment.sh"
+
+    # Run as root
     bash /opt/setup.sh
+    cd /opt/BDWatchdog/MetricsFeeder && bash scripts/run_atop_stream_with_java_translation.sh
+
+    # Run as regular user
+    su - {{ user_info.user_name }} -c "source $ENVFILE \
+        && bash /opt/setup.sh \
+        && cd /opt/BDWatchdog/MetricsFeeder \
+        && bash /opt/java_snitch.sh"

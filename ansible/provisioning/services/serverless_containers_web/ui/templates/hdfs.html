@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% load custom_tags %}
+
+{% block page_content %}
+
+<!-- Menu -->
+{% include 'functions/menu.html' with config=config active="hdfs" %}
+
+<div class="content">
+
+    <H1>HDFS</H1>
+
+    <!-- Requests -->
+    {% include 'functions/alerts.html' with requests=requests %}
+
+    <!-- Start/Stop global HDFS switch -->
+    <div>
+        {% include 'functions/switch.html' with switch_url="manage_global_hdfs" switch_name="manage_global_hdfs" switch_prefix="hdfs" state=global_hdfs_app|is_not_none on_state_label="Stop global HDFS" off_state_label="Start global HDFS" %}
+    </div>
+    <br>
+
+    {% if global_hdfs_ready %}
+        <p><a href="{{ namenode_url }}">Namenode</a></p>
+    {% endif %}
+
+    <!-- Global HDFS app -->
+    {% if global_hdfs_ready and config.display_global_hdfs_app %}
+        <ul>
+            <li>
+                {% include 'functions/app_data_full.html' with app=global_hdfs_app %}
+            </li>
+        </ul>
+    {% endif %}
+
+    <!-- Global HDFS data -->
+    {% if global_hdfs_ready %}
+        <div>
+            <table class="data_table">	
+                <tr>
+                    <th>Parent Directory</th>
+                    <th>Permission</th>
+                    <th>Owner</th>
+                    <th>Group</th>
+                    <th>Size</th>
+                    <th>Last Modified</th>
+                    <th>Replication</th>
+                    <th>Block Size</th>
+                    <th>Name</th>
+                    <th class="hdfs_actions">
+                        {% include 'functions/form.html' with form_id="add-hdfs-dir" button_name="Create Directory" form_title="Create HDFS Directory" form=addDirForm icon="fa fa-folder-open" %}
+                    </th>
+                    <th class="hdfs_actions">
+                        {% include 'functions/form.html' with form_id="add-hdfs-file" button_name="Upload File or Directory" form_title="Add HDFS File or Directory" form=addFileForm icon="fa fa-cloud-upload" %}
+                    </th>
+                    <th class="hdfs_actions">
+                        {% include 'functions/form.html' with form_id="del-hdfs-file" button_name="Delete File or Directory" form_title="Delete HDFS File or Directory" form=delFileForm icon="fa fa-trash" %}
+                    </th>
+                </tr>
+                {% for entry in data %}
+                    <tr>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'parent_dir'    in entry %} {{entry.parent_dir}}    {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'permissions'   in entry %} {{entry.permissions }}  {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'owner'         in entry %} {{entry.owner}}         {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'group'         in entry %} {{entry.group}}         {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'size'          in entry %} {{entry.size}}          {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'last_update'   in entry %} {{entry.last_update}}   {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'replication'   in entry %} {{entry.replication}}   {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'blocksize'     in entry %} {{entry.blocksize }}    {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_data">{% autoescape off %}{% if 'name'          in entry %} {{entry.name }}         {% else %}-{% endif %}{% endautoescape %}</td>
+                        <td class="hdfs_actions">
+                            {% if 'get_hdfs_file' in entry %}
+                                {% include 'functions/form.html' with form_id="get-hdfs-file-"|add:entry.get_hdfs_file.origin_path.initial button_name="Download" form_title="Download HDFS File or Directory" form=entry.get_hdfs_file icon="fa fa-cloud-download" %}
+                                {% else %}
+                                    -
+                                {% endif %}
+                        </td>
+                        <td class="hdfs_actions">
+                            {% if 'del_hdfs_file' in entry %}
+                                {% include 'functions/form.html' with form_id="del-hdfs-file-"|add:entry.del_hdfs_file.dest_path.initial button_name="Delete" form_title="Delete HDFS File or Directory" form=entry.del_hdfs_file icon="fa fa-trash" %}
+                                {% else %}
+                                    -
+                                {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </table>
+        </div>
+    {% endif %}
+</div>
+
+<HR>
+
+{% endblock %}

@@ -1,9 +1,18 @@
+## Web interface
 Django==2.1.15
 django-crispy-forms<2.0
 django_json_widget
 beautifulsoup4
-libtmux==0.10.2
-ansible_runner
+selenium
+
+## Celery
 celery
-redis
 gevent<25
+ansible_runner
+
+## Redis server
+redis
+
+## Rebooter
+libtmux==0.10.2
+watchdog

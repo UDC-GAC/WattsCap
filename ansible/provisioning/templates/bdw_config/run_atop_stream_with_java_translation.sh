@@ -3,9 +3,9 @@
 ## Script that YARN containers will run to report usage metrics + the disaggregated usage of each Java process
 
 export PYTHONUNBUFFERED="yes"
-export POST_DOC_BUFFER_TIMEOUT=5
+export POST_DOC_BUFFER_TIMEOUT=0.2
 
-METRIC="CPU,cpu,MEM,SWP,DSK,NET,PRC,PRM,PRD"
+METRIC="CPU,cpu,MEM,SWP,NET,PRC,PRM,PRD"
 #METRIC="PRC,PRM,PRD"
 
 scriptDir=$(dirname -- "$(readlink -f -- "$BASH_SOURCE")")

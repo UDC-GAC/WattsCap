@@ -1,78 +1,160 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
-## Load variables from config file
+## Load variables from config file(s)
 require 'yaml'
-current_dir    = File.dirname(File.expand_path(__FILE__))
-configs        = YAML.load_file("#{current_dir}/ansible/provisioning/config/config.yml")
+current_dir           = File.dirname(File.expand_path(__FILE__))
+config_dir            = "#{current_dir}/ansible/provisioning/config/modules"
+general_config_file   = File.exist?("#{config_dir}/01-general.yml") ? "#{config_dir}/01-general.yml" : "#{config_dir}/template.01-general.yml"
+host_config_file      = File.exist?("#{config_dir}/02-hosts.yml") ? "#{config_dir}/02-hosts.yml" : "#{config_dir}/template.02-hosts.yml"
+general_config        = YAML.load_file(general_config_file)
+host_config           = YAML.load_file(host_config_file)
 
 ## Server
-SERVER_IP = configs['server_ip']
-CPU_SERVER_NODE = configs['cpus_server_node']
-MEMORY_SERVER_NODE = configs['memory_server_node']
-WEB_INTERFACE_PORT = configs['web_interface_port']
+SERVER_HOSTNAME = "server"
+SERVER_IP = host_config['server_ip']
+CPU_SERVER_NODE = host_config['cpus_server_node']
+MEMORY_SERVER_NODE = host_config['memory_server_node']
+WEB_INTERFACE_PORT = host_config['web_interface_port']
 
 ## Hosts
-N = configs['number_of_hosts']
-CPUS_PER_NODE = configs['cpus_per_host']
-MEMORY_PER_NODE = configs['memory_per_host']
+N = host_config['number_of_hosts']
+CPUS_PER_NODE = host_config['cpus_per_host']
+MEMORY_PER_NODE = host_config['memory_per_host']
 
-CGROUPS_VERSION = configs['cgroups_version']
+CGROUPS_VERSION = general_config['cgroups_version']
+
+hostnames = [] ## variable to store hostnames used for the deployed server and worker nodes
+$config_updated = false ## variable to track whether the configuration was modified during a provision
+
+if host_config['server_as_host']
+then
+    N -= 1
+end
 
 Vagrant.configure("2") do |config|
 
-  config.vm.box = "bento/ubuntu-22.04" 
-  config.vm.box_version = "202407.23.0"
-  config.vm.box_check_update = false
+    config.vm.box = "bento/ubuntu-22.04"
+    config.vm.box_version = "202407.23.0"
+    config.vm.box_check_update = false
 
-  # hostmanager and vbguest plugins
-  config.hostmanager.enabled = true
-  config.hostmanager.manage_host = true
-  config.hostmanager.manage_guest = true
-  config.hostmanager.ignore_private_ip = false
-  config.vbguest.auto_update = false
+    # hostmanager and vbguest plugins
+    config.hostmanager.enabled = true
+    config.hostmanager.manage_host = true
+    config.hostmanager.manage_guest = true
+    config.hostmanager.ignore_private_ip = false
+    config.vbguest.auto_update = false
 
-  # Master Node aka Server
-  config.vm.define "server", primary: true do |server|
-  	server.vm.hostname = "server"
-  	server.vm.provision "shell", path: "provision/server.sh"
-  	server.vm.network "private_network", ip: SERVER_IP	
-  	server.vm.network "forwarded_port", guest: WEB_INTERFACE_PORT, host: WEB_INTERFACE_PORT, host_ip: "127.0.0.1"
+    # Master Node aka Server
+    config.vm.define "server", primary: true do |server|
+        server.vm.hostname = SERVER_HOSTNAME
+        hostnames << SERVER_HOSTNAME
 
-  	server.vm.provider "virtualbox" do |vb|
-		vb.name = "ServerlessYARN-Server"
-		vb.customize ["modifyvm", :id, "--groups", "/ServerlessYARN"]
-  		vb.cpus = CPU_SERVER_NODE
-  		vb.memory = MEMORY_SERVER_NODE
-		vb.gui = false
-		vb.linked_clone = false
-  	end
-  end	
+        server.vm.provision "main_setup", type: "shell", path: "provision/server.sh"
 
+        server.vm.provision "cgroups_setup", type: "shell", path: "provision/cgroups_setup.sh", args: CGROUPS_VERSION
+        server.vm.provision :reload
 
-  server_ip_to_number = SERVER_IP.split(".").map(&:to_i).pack('CCCC').unpack('N')[0]
+        ## run only when explicitly specified
+        server.vm.provision "full_ssh_setup", type: "shell", path: "provision/full_passwordless_ssh.sh", args: SERVER_HOSTNAME, run: "never"
 
-  ## N Worker Nodes aka Hosts
-  (0..N-1).each do |i|
-    config.vm.define "host#{i}" do |node|
-		node.vm.hostname = "host#{i}"
-		node.vm.provision "shell", path: "provision/nodes.sh"
+        server.vm.network "private_network", ip: SERVER_IP
+        server.vm.network "forwarded_port", guest: WEB_INTERFACE_PORT, host: WEB_INTERFACE_PORT, host_ip: "127.0.0.1"
 
-		node.vm.provision "shell", path: "provision/cgroups_setup.sh", args: CGROUPS_VERSION
-		node.vm.provision :reload
-
-		number_to_ip = [server_ip_to_number + 1 + i].pack('N').unpack('CCCC').join('.')
-		node.vm.network :private_network, ip: number_to_ip
-
-		node.vm.provider "virtualbox" do |vb|
-			vb.name = "ServerlessYARN-Host#{i}"
-			vb.customize ["modifyvm", :id, "--groups", "/ServerlessYARN"]
-			vb.cpus = CPUS_PER_NODE
-			vb.memory = MEMORY_PER_NODE
-			vb.gui = false
-			vb.linked_clone = false
-		end
+        server.vm.provider "virtualbox" do |vb|
+            vb.name = "ServerlessYARN-Server"
+            vb.customize ["modifyvm", :id, "--groups", "/ServerlessYARN"]
+            vb.cpus = CPU_SERVER_NODE
+            vb.memory = MEMORY_SERVER_NODE
+            vb.gui = false
+            vb.linked_clone = false
+        end
     end
-  end
+
+
+    server_ip_to_number = SERVER_IP.split(".").map(&:to_i).pack('CCCC').unpack('N')[0]
+
+    ## N Worker Nodes aka Hosts
+    (0..N-1).each do |i|
+        config.vm.define "host#{i}" do |node|
+            node.vm.hostname = "host#{i}"
+            hostnames << node.vm.hostname
+
+            node.vm.provision "main_setup", type: "shell", path: "provision/nodes.sh", args: SERVER_HOSTNAME
+
+            node.vm.provision "cgroups_setup", type: "shell", path: "provision/cgroups_setup.sh", args: CGROUPS_VERSION
+            node.vm.provision :reload
+
+            ## run only when explicitly specified
+            node.vm.provision "full_ssh_setup", type: "shell", path: "provision/full_passwordless_ssh.sh", args: SERVER_HOSTNAME, run: "never"
+
+            number_to_ip = [server_ip_to_number + 1 + i].pack('N').unpack('CCCC').join('.')
+            node.vm.network "private_network", ip: number_to_ip
+
+            node.vm.provider "virtualbox" do |vb|
+                vb.name = "ServerlessYARN-Host#{i}"
+                vb.customize ["modifyvm", :id, "--groups", "/ServerlessYARN"]
+                vb.cpus = CPUS_PER_NODE
+                vb.memory = MEMORY_PER_NODE
+                vb.gui = false
+                vb.linked_clone = false
+            end
+        end
+    end
+
+    ## Runs after provisioning
+    config.trigger.after :up do |trigger|
+        trigger.ruby do |env, machine|
+            if !$config_updated ## we avoid repeating this task if the config was updated by a previous provision (e.g., when running 'vagrant up server host0')
+                ### Update config parameter 'hostnames'
+                #### We update the raw file instead of using the yaml library to keep comments
+                host_raw_config = File.read(host_config_file)
+                clean_hostnames = hostnames.map(&:strip).join(',')
+                updated_content = host_raw_config.gsub(/^(\s*hostnames:\s*).*\n/, "\hostnames: #{clean_hostnames}\n")
+                File.write(host_config_file, updated_content)
+                puts "==> trigger: File #{host_config_file} has been updated with hostnames: #{hostnames}"
+                $config_updated = true
+            else
+                puts "==> trigger: File #{host_config_file} was already updated. Skipping..."
+            end
+        end
+    end
+
+    # Node with centos 7.9
+    # TODO: fix missing guest additions
+    config.vm.define "centos_node", autostart: false do |centos|
+        centos.vm.box = "geerlingguy/centos7"
+        centos.vm.box_version = "1.2.27"
+        centos.vm.host_name = "centos-node"
+
+        centos.vm.provision "centos_upgrade", type: "shell", path: "provision/centos_upgrade.sh"
+        centos.vm.provision :reload
+
+        centos.vm.network "private_network", ip: "192.168.56.250"
+        centos.vm.provider "virtualbox" do |vb|
+                vb.name = "Centos Node"
+                vb.customize ["modifyvm", :id, "--groups", "/ServerlessYARN"]
+                vb.cpus = 2
+                vb.memory = 2048
+        end
+    end
+
+    # Node for OpenTSDB
+    ## Useful to deploy a local, persistent instance of OpenTSDB that is independent of the server node (which is more oriented towards testing)
+    config.vm.define "opentsdb", autostart: false do |opentsdb|
+        opentsdb.vm.box = "bento/ubuntu-22.04"
+        opentsdb.vm.box_version = "202407.23.0"
+        opentsdb.vm.host_name = "opentsdb-node"
+
+        opentsdb.vm.network "private_network", ip: "192.168.56.220"
+        opentsdb.vm.network "forwarded_port", guest: 4242, host: 4343, host_ip: "127.0.0.1"
+
+        opentsdb.vm.provider "virtualbox" do |vb|
+                vb.name = "OpenTSDB"
+                vb.customize ["modifyvm", :id, "--groups", "/ServerlessYARN"]
+                vb.cpus = 4
+                vb.memory = 4096
+        end
+    end
 
 end

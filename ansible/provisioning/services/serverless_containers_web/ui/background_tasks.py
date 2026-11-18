@@ -1,17 +1,33 @@
 import time
-import subprocess
-from ui.update_inventory_file import add_containers_to_hosts,remove_container_from_host, add_host, remove_host, add_disks_to_hosts
-from ui.utils import request_to_state_db
-from celery import shared_task, chain, chord, group
-from celery.result import AsyncResult, allow_join_result
-import redis
 import json
 import timeit
 import yaml
+import uuid
+import redis
+import urllib
+import subprocess
+from contextlib import contextmanager
+
+from celery import shared_task, group
+from celery.result import AsyncResult
+
+from django.conf import settings
+
+from serverless_containers_web.celery import app as celery_app
+from serverlessyarn_utils.web_utils import web_request
+
+from ui.views.core.utils import getDbData, getDataAndFilterByApp, getHostsNames
+from ui.update_inventory_file import add_containers_to_hosts, remove_container_from_host, add_host, remove_host, add_disks_to_hosts, add_containers_to_inventory
+import ui.run_playbooks as run_playbooks
+
+from ui.views.apps.utils import getContainerAssignationForApp
+from ui.views.core.utils import getDbData, getDataAndFilterByApp, getHostsNames
 
 config_path = "../../config/config.yml"
-with open(config_path, "r") as config_file:
-    config = yaml.load(config_file, Loader=yaml.FullLoader)
+with open(config_path, "r") as config_file: config = yaml.load(config_file, Loader=yaml.FullLoader)
+
+vars_path = "../../vars/main.yml"
+with open(vars_path, "r") as vars_file: vars_config = yaml.load(vars_file, Loader=yaml.FullLoader)
 
 redis_server = redis.StrictRedis()
 redis_prefix = "pending_tasks"
@@ -22,9 +38,34 @@ def register_task(task_id, task_name):
     key = "{0}:{1}".format(redis_prefix,task_id)
     redis_server.hset(key, "task_name", task_name)
 
+def create_artificial_task(task_name, status, result=None):
+    ## 1: create fake task that represents the work task
+    task_id = str(uuid.uuid4())
+    celery_app.backend.store_result(
+        task_id=task_id,
+        result=result,
+        state=status.upper()
+    )
+    ## 2: register wrapper pending task
+    register_task(task_id, task_name)
+
+    return task_id
+
 def update_task_runtime(task_id, runtime):
     key = "{0}:{1}".format(redis_prefix,task_id)
     redis_server.hset(key, "runtime", runtime)
+
+def remove_task(task_id):
+    redis_server.delete("{0}:{1}".format(redis_prefix, task_id))
+
+def remove_task_by_name(task_name):
+    for key in redis_server.scan_iter("{0}:*".format(redis_prefix)):
+        stored_task_name = redis_server.hget(key, "task_name")
+        if stored_task_name and stored_task_name.decode("utf-8") == task_name:
+            task_id = key.decode("utf-8")[len(redis_prefix) + 1:]
+            if task_id:
+                remove_task(task_id)
+                return
 
 def get_pending_tasks():
     still_pending_tasks = []
@@ -32,30 +73,35 @@ def get_pending_tasks():
     failed_tasks = []
 
     for key in redis_server.scan_iter("{0}:*".format(redis_prefix)):
-        task_name = redis_server.hget(key, "task_name").decode("utf-8")
+        task_name = redis_server.hget(key, "task_name")
+        task_name = "None" if task_name is None else task_name.decode("utf-8")
         task_id = key.decode("utf-8")[len(redis_prefix) + 1:]
         task_result = AsyncResult(task_id)
-        status = task_result.status
+        status = task_result.status ## the 'status' attribute is an alias for 'state', i.e., both have the same value
 
         if status != "SUCCESS" and status != "FAILURE":
             still_pending_tasks.append((task_id,task_name))
         elif status == "SUCCESS":
-            if redis_server.hexists(key, "runtime"): runtime = redis_server.hget(key, "runtime").decode("utf-8")
-            else: runtime = None
+            if redis_server.hexists(key, "runtime"):
+                runtime = redis_server.hget(key, "runtime").decode("utf-8")
+            else:
+                runtime = None
             successful_tasks.append((task_id,task_name,runtime))
         else:
             failed_tasks.append((task_id,task_name,task_result.result))
 
     # remove completed or failed tasks
     for task_id, task_name, runtime in successful_tasks:
-        redis_server.delete("{0}:{1}".format(redis_prefix, task_id))
+        redis_server.delete(f"{redis_prefix}:{task_id}")
+        redis_server.delete(f"celery-task-meta-{task_id}")
 
     for task_id, task_name, task_error in failed_tasks:
-        redis_server.delete("{0}:{1}".format(redis_prefix, task_id))
+        redis_server.delete(f"{redis_prefix}:{task_id}")
+        redis_server.delete(f"celery-task-meta-{task_id}")
 
     return still_pending_tasks, successful_tasks, failed_tasks
 
-def get_pendings_tasks_to_string():
+def get_pending_tasks_messages():
     still_pending_tasks, successful_tasks, failed_tasks = get_pending_tasks()
 
     still_pending_tasks_string = []
@@ -64,20 +110,31 @@ def get_pendings_tasks_to_string():
 
     for task_id, task_name in still_pending_tasks:
         info = "Task with ID {0} and name {1} is pending".format(task_id,task_name)
-        still_pending_tasks_string.append(info)
+        still_pending_tasks_string.append({"id": task_id, "message": info})
 
     for task_id, task_name, runtime in successful_tasks:
         if runtime != None: runtime_str = " in {0} seconds".format(runtime)
         else: runtime_str = ""
         success = "Task with ID {0} and name {1} has completed successfully{2}".format(task_id,task_name,runtime_str)
-        successful_tasks_string.append(success)
+        successful_tasks_string.append({"id": task_id, "message": success})
 
     for task_id, task_name, task_error in failed_tasks:
         error = "Task with ID {0} and name {1} has failed with error: {2}".format(task_id,task_name,task_error)
-        failed_tasks_string.append(error)
+        failed_tasks_string.append({"id": task_id, "message": error})
 
     return still_pending_tasks_string, successful_tasks_string, failed_tasks_string
 
+def create_app_counter(app_name, initial_value):
+    task_id = f"app:{app_name}"
+    redis_server.hset(task_id, "active_containers", initial_value)
+
+def get_app_counter(app_name):
+    task_id = f"app:{app_name}"
+    return redis_server.hget(task_id, "active_containers").decode("utf-8")
+
+def remove_app_counter(app_name):
+    task_id = f"app:{app_name}"
+    redis_server.delete(task_id)
 
 ## Auxiliary
 def container_list_to_formatted_str(container_list):
@@ -89,6 +146,26 @@ def mergeDictionary(dict_1, dict_2):
        if key in dict_1 and key in dict_2:
                dict_3[key] = value + dict_2[key]
    return dict_3
+
+def convert_strings_to_numbers(data):
+    """
+    Recursively convert string numbers to int/float in nested dictionaries and lists.
+    """
+    if isinstance(data, dict):
+        return {key: convert_strings_to_numbers(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [convert_strings_to_numbers(item) for item in data]
+    elif isinstance(data, str):
+        # Try to convert to int first, then float
+        try:
+            return int(data)
+        except ValueError:
+            try:
+                return float(data)
+            except ValueError:
+                return data
+    else:
+        return data
 
 def get_node_reserved_memory(node_memory):
     reserved_memory = 0
@@ -141,20 +218,169 @@ def get_min_container_size(node_memory):
 
     return min_container_size
 
-def process_script(script_name, argument_list, error_message):
+def set_hadoop_resources(container_resources, virtual_cluster, number_of_workers, replication_factor=settings.PLATFORM_CONFIG['default_hdfs_replication']):
 
-    rc = subprocess.Popen(["./ui/scripts/{0}.sh".format(script_name), *argument_list], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = rc.communicate()
+    hadoop_resources = {}
 
-    # Log ansible output
-    print(out.decode("utf-8"))
+    total_cores = max(int(container_resources["cpu_max"])//100,1)
+    min_cores = max(int(container_resources["cpu_min"])//100,1)
+    total_memory = int(container_resources["mem_max"])
+    total_disks = 1
+    heapsize_factor = 0.9
 
-    if rc.returncode != 0:
-        extracted_error = err.decode("utf-8")
-        if extracted_error.strip() == "": extracted_error = "Please consult Celery log under services/celery for further details"
+    ## 'Classic' way of calculating resources:
+    #reserved_memory = get_node_reserved_memory(total_memory)
+    #available_memory = total_memory - reserved_memory
+    #min_container_size = get_min_container_size(total_memory)
 
-        error = "{0}: {1}".format(error_message, extracted_error)
-        raise Exception(error)
+    #number_of_hadoop_containers = int(min(2*total_cores, 1.8*total_disks, available_memory/min_container_size))
+    # mem_per_container = max(min_container_size, available_memory/number_of_hadoop_containers)
+
+    # scheduler_maximum_memory = int(number_of_hadoop_containers * mem_per_container)
+    # scheduler_minimum_memory = int(mem_per_container)
+    # nodemanager_memory = scheduler_maximum_memory
+    # map_memory = scheduler_minimum_memory
+    # reduce_memory = int(min(2*mem_per_container, available_memory))
+    # mapreduce_am_memory = reduce_memory
+
+
+    ## 'BDEv' way of calculating resources:
+    #number_of_hadoop_containers = int(min(2*total_cores, available_memory/min_container_size))
+
+    if virtual_cluster:
+        ## Virtual cluster config (test environment with low resources)
+        hyperthreading = False
+        app_master_heapsize = 128
+        datanode_heapsize = 128
+        nodemanager_heapsize = 128
+    else:
+        ## Physical cluster config (real environment with (presumably) high resources)
+        hyperthreading = True
+        app_master_heapsize = 1024
+        datanode_heapsize = 1024
+        nodemanager_heapsize = 1024
+
+    ## adjust total_cores to hyperthreading system
+    ## TODO: check if system actually has hyperthreading
+    if hyperthreading:
+        total_cores = total_cores // 2
+
+    app_master_memory_overhead = int(app_master_heapsize * 0.1)
+    if app_master_memory_overhead < 384:
+        app_master_memory_overhead = 384
+    mapreduce_am_memory = app_master_heapsize + app_master_memory_overhead
+
+    memory_per_container_factor = 0.95
+    available_memory = int(total_memory * memory_per_container_factor)
+    nodemanager_memory = available_memory - nodemanager_heapsize - datanode_heapsize
+
+    mem_per_container = int((nodemanager_memory - mapreduce_am_memory) / total_cores)
+
+    map_memory_ratio = 1
+    reduce_memory_ratio = 1
+    map_memory = int(min(mem_per_container * map_memory_ratio, available_memory))
+    reduce_memory = int(min(mem_per_container * reduce_memory_ratio, available_memory))
+
+    scheduler_maximum_memory = nodemanager_memory
+    #scheduler_minimum_memory = int(mem_per_container)
+    scheduler_minimum_memory = 256
+
+    # total_available_memory = 0
+    # for host in new_containers:
+    #     if container_type in new_containers[host]:
+    #         total_available_memory += available_memory * new_containers[host][container_type]
+    total_available_memory = available_memory * number_of_workers
+
+    if total_available_memory < map_memory + reduce_memory + mapreduce_am_memory:
+        memory_slice = nodemanager_memory/3.5
+        scheduler_minimum_memory = int(memory_slice)
+        map_memory = scheduler_minimum_memory
+        reduce_memory = scheduler_minimum_memory
+        mapreduce_am_memory = int(1.5 * memory_slice)
+
+    map_memory_java_opts = int(heapsize_factor * map_memory)
+    reduce_memory_java_opts = int(heapsize_factor * reduce_memory)
+    #mapreduce_am_memory_java_opts = int(heapsize_factor * mapreduce_am_memory)
+    mapreduce_am_memory_java_opts = app_master_heapsize
+
+    hadoop_resources = {
+        "vcores": str(total_cores),
+        "min_vcores": str(min_cores),
+        "scheduler_maximum_memory": str(scheduler_maximum_memory),
+        "scheduler_minimum_memory": str(scheduler_minimum_memory),
+        "nodemanager_memory": str(nodemanager_memory),
+        "map_memory": str(map_memory),
+        "map_memory_java_opts": str(map_memory_java_opts),
+        "reduce_memory": str(reduce_memory),
+        "reduce_memory_java_opts": str(reduce_memory_java_opts),
+        "mapreduce_am_memory": str(mapreduce_am_memory),
+        "mapreduce_am_memory_java_opts": str(mapreduce_am_memory_java_opts),
+        "datanode_heapsize": str(datanode_heapsize),
+        "nodemanager_heapsize": str(nodemanager_heapsize),
+        "hdfs_replication": str(replication_factor),
+    }
+
+    # Check assigned resources are valid
+    for resource in hadoop_resources:
+        value = int(hadoop_resources[resource])
+        if value <= 0:
+            bottleneck_resource = "CPU" if resource in ["vcores", "min_vcores"] else "memory"
+            raise Exception("Error allocating resources for containers in Hadoop application. "
+                            "Value for '{0}' is negative ({1}). The application may have been assigned "
+                            "too low {2} values.".format(resource, value, bottleneck_resource))
+
+    return hadoop_resources
+
+def extract_hadoop_resources(hadoop_resources):
+
+    resources_to_extract = ["vcores", "min_vcores", "scheduler_maximum_memory", "scheduler_minimum_memory", "nodemanager_memory", 
+                            "map_memory", "map_memory_java_opts", "reduce_memory", "reduce_memory_java_opts", "mapreduce_am_memory", 
+                            "mapreduce_am_memory_java_opts", "datanode_heapsize", "nodemanager_heapsize", "hdfs_replication"]
+    extracted_resources = []
+
+    for resource in resources_to_extract:
+        extracted_resources.append(hadoop_resources[resource])
+
+    return extracted_resources
+
+
+def manage_scaling_services(enable, skip_ansible=True):
+    # When the EnergyManager is running none of Scaler, Guardian, Rebalancer or EnergyController run
+    # EnergyManager is paused by the Orchestrator when a host is being modified
+    if settings.PLATFORM_CONFIG.get("scaling_service", "scaler") == "energy_manager":
+        return
+
+    if skip_ansible:
+        sc_path = "{0}/ServerlessContainers".format(settings.INSTALLATION_PATH)
+        services = ["Scaler", "Guardian", "Rebalancer"] + (["EnergyController"] if settings.PLATFORM_CONFIG["power_budgeting"] else [])
+        script = "activate.sh" if enable else "deactivate.sh"
+
+        # Deactivate services in parallel
+        processes = []
+        for service in services:
+            p = subprocess.Popen(["bash", f"{sc_path}/scripts/orchestrator/{service}/{script}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            processes.append((service, p))
+
+        # Wait for output to check there is no errors
+        for service, p in processes:
+            out, err = p.communicate()
+            print("{0} {1} using local scripts: {2}".format("Activating" if enable else "Deactivating", service, out.decode("utf-8")))
+            if p.returncode != 0:
+                extracted_error = err.decode("utf-8")
+                if extracted_error.strip() == "":
+                    extracted_error = "Please consult Celery log under services/celery for further details"
+                raise Exception("Error managing scaling service {0} (enable={1}): {2}".format(service, enable, extracted_error))
+    else:
+        run_playbooks.manage_scaling_services(enable=enable)
+
+@contextmanager
+def scaling_services_disabled():
+    manage_scaling_services(enable=False)
+    try:
+        yield
+    finally:
+        manage_scaling_services(enable=True)
+
 
 ## Adds
 @shared_task
@@ -164,12 +390,24 @@ def add_host_task(host,cpu,mem,disk_info,energy,new_containers):
     with redis_server.lock(lock_key):
         add_host(host,cpu,mem,disk_info,energy,new_containers)
 
-    argument_list = [host]
-    error_message = "Error adding host {0}".format(host)
-    process_script("configure_host", argument_list, error_message)
+    run_playbooks.configure_host(host)
+
+def getHostsInfo(url):
+
+    response = urllib.request.urlopen(url)
+    data_json = json.loads(response.read())
+
+    hosts = {}
+
+    for item in data_json:
+        if (item['subtype'] == 'host'):
+
+            hosts[item["name"]] = item
+
+    return hosts
 
 @shared_task
-def add_disks_to_hosts_task(host_list, add_to_lv, new_disks, extra_disk):
+def add_disks_to_hosts_task(host_list, add_to_lv, new_disks, extra_disk, measure_host_list, structures_url, threshold, polling_frequency, timeout_events):
 
     # update_inventory_file
     with redis_server.lock(lock_key):
@@ -177,56 +415,122 @@ def add_disks_to_hosts_task(host_list, add_to_lv, new_disks, extra_disk):
 
     if add_to_lv:
         ## Add disks to existing LV
-        argument_list = [','.join(host_list), " ".join(new_disks), extra_disk]
-        error_message = "Error extending LV of hosts {0} with disks {1} and extra disk {2}".format(host_list, str(new_disks), extra_disk)
-        process_script("extend_lv", argument_list, error_message)
+        ## 1st, extend LVs with no containers, so inmediate benchmark can be run on them
+        for host in measure_host_list:
+            if measure_host_list[host]:
+                task = run_playbooks.extend_lv.delay([host], ",".join(new_disks), extra_disk, str(measure_host_list).replace(' ',''))
+                register_task(task.id, "extend_lv_task")
+                host_list.remove(host)
+
+        ## 2nd, remaining hosts have containers. Pool their consumed bandwidth to check if they can be extended
+        current_events = 0
+        while current_events < timeout_events and len(host_list) > 0:
+            finished_hosts = []
+            hosts_full_info = getHostsInfo(structures_url) # refresh host info
+            for host in host_list:
+                # get host free bandwidth
+                host_max_read_bw = hosts_full_info[host]["resources"]["disks"]["lvm"]["max_read"]
+                host_max_write_bw = hosts_full_info[host]["resources"]["disks"]["lvm"]["max_write"]
+                host_free_read_bw = hosts_full_info[host]["resources"]["disks"]["lvm"]["free_read"]
+                host_free_write_bw = hosts_full_info[host]["resources"]["disks"]["lvm"]["free_write"]
+                consumed_read = host_max_read_bw - host_free_read_bw
+                consumed_write = host_max_write_bw - host_free_write_bw
+                total_free_bw = max(host_max_read_bw, host_max_write_bw) - consumed_read - consumed_write
+                # compare bw with threshold
+                if (max(host_max_read_bw, host_max_write_bw) - total_free_bw <= max(host_max_read_bw, host_max_write_bw) * threshold
+                    and host_max_read_bw  - host_free_read_bw  <= host_max_read_bw  * threshold
+                    and host_max_write_bw - host_free_write_bw <= host_max_write_bw * threshold
+                    ):
+                    ## enough free bandwidth to execute benchmark anyways
+                    task = run_playbooks.extend_lv.delay([host], ",".join(new_disks), extra_disk, str(measure_host_list).replace(' ',''))
+                    register_task(task.id, "extend_lv_task")
+                    finished_hosts.append(host)
+                else:
+                    ## consumed bandwidth over the threshold, extend postponed
+                    pass
+
+            host_list = [host for host in host_list if host not in finished_hosts]
+            current_events += 1
+            if current_events < timeout_events and len(host_list) > 0:
+                time.sleep(polling_frequency)
+
+
+        ## if timeout_events == -1 -> execute extension without limiting (?)
+
+        ## 3rd, hosts that were not able to reduce bandwidth under the threshold; will extend lv regardless, but capping the available bandiwdth of their containers
+        if len(host_list) > 0:
+            run_playbooks.extend_lv(host_list, new_disks, extra_disk, str(measure_host_list).replace(' ',''), throttle_containers_bw=True)
 
     else:
         ## Add disks just as new individual disks
         formatted_added_disks = str(added_disks).replace(' ','')
-        argument_list = [','.join(host_list), formatted_added_disks]
-        error_message = "Error adding disks {0} to hosts {1}".format(str(new_disks), host_list)
-        process_script("add_disks", argument_list, error_message)
+        run_playbooks.add_disks(host_list, formatted_added_disks)
 
 @shared_task
-def add_app_task(full_url, put_field_data, app, app_files):
-
+def add_app_task(full_url, put_field_data, app, app_files, user=None):
     error_message = "Error adding app {0}".format(app)
-    error, _ = request_to_state_db(full_url, "put", error_message, put_field_data)
+    error, _ = web_request(full_url, "put", error_message, put_field_data)
 
-    if (not error):
-
-        ## TODO: discuss which of the following versions should be used
-        ## V1: send install_script, files_dir, etc into create_app script as args
-        #if (app_files['install_script'] != ""):
-
-        app_dir = app_files['app_dir']
-        files_dir = app_files['files_dir']
-        install_script = app_files['install_script']
-        app_type = app_files['app_type']
-        app_jar = app_files['app_jar']
-
-        argument_list = [app_dir, files_dir, install_script, app_type, app_jar]
-        error_message = "Error creating app {0}".format(app)
-        process_script("create_app", argument_list, error_message)
-
-        # ## V2: just send app name as argument for the script
-        # argument_list = [app]
-        # error_message = "Error creating app {0}".format(app)
-        # process_script("create_app", argument_list, error_message)
-
+    if not error:
+        run_playbooks.create_app(app_files)
     else:
         raise Exception(error)
 
-def add_container_to_app_in_db(full_url, container, app):
+    # If a user is specified subscribe app to user
+    if user and user != "":
+        parsed_url = urllib.parse.urlparse(full_url)
+        user_url = "{0}://{1}/user/clusters/{2}/{3}".format(parsed_url.scheme, parsed_url.netloc, user, app)
+        manage_app_with_user_in_db(user_url, app, user, "put")
 
+@shared_task
+def add_user_task(full_url, put_field_data, user):
+    error_message = "Error adding user {0}".format(user)
+    error, _ = web_request(full_url, "put", error_message, put_field_data)
+    if error:
+        raise Exception(error)
+
+@shared_task
+def subscribe_apps_to_user(url, user_name, user_apps):
+    with scaling_services_disabled():
+        # Subscribe containers to app in ServerlessContainers database
+        for app_name in user_apps:
+            full_url = url + "clusters/{0}/{1}".format(user_name, app_name)
+            manage_app_with_user_in_db(full_url, user_name, app_name, "put")
+
+@shared_task
+def desubscribe_apps_from_user(url, user_name, user_apps):
+    with scaling_services_disabled():
+        # Subscribe containers to app in ServerlessContainers database
+        for app_name in user_apps:
+            full_url = url + "clusters/{0}/{1}".format(user_name, app_name)
+            manage_app_with_user_in_db(full_url, user_name, app_name, "delete")
+
+def change_app_state_in_db(url, app, state):
+    max_retries = 10
+    actual_try = 0
+    full_url = f"{url}{app}/state/{state}"
+    while actual_try < max_retries:
+
+        error_message = "Error changing app {0} execution state to {1}".format(app, state)
+        error, response = web_request(full_url, "put", error_message)
+
+        if response != "":
+            if not error: break
+            else: raise Exception(error)
+
+        actual_try += 1
+
+    if actual_try >= max_retries:
+        raise Exception("Reached max tries when changing app {0} execution state to {1}".format(app, state))
+
+def add_container_to_app_in_db(full_url, container, app):
     max_retries = 10
     actual_try = 0
 
     while actual_try < max_retries:
 
         error_message = "Error adding container {0} to app {1}".format(container, app)
-        error, response = request_to_state_db(full_url, "put", error_message)
+        error, response = web_request(full_url, "put", error_message)
 
         if response != "":
             if not error: break
@@ -238,23 +542,40 @@ def add_container_to_app_in_db(full_url, container, app):
     if actual_try >= max_retries:
         raise Exception("Reached max tries when adding {0} to app {1}".format(container, app))
 
+def manage_app_with_user_in_db(full_url, app, user, operation):
+    max_retries = 10
+    actual_try = 0
+
+    while actual_try < max_retries:
+
+        error_message = "Error adding app {0} to user {1}".format(app, user)
+        error, response = web_request(full_url, operation, error_message)
+
+        if response != "":
+            if not error:
+                break
+            if response.status_code == 400:
+                if "already subscribed" in error or "missing in" in error: # App is already subscribed/desubscribed
+                    break
+            raise Exception(error)
+
+        actual_try += 1
+
+    if actual_try >= max_retries:
+        raise Exception("Reached max tries when adding {0} to user {1}".format( app, user))
+
 @shared_task
-def add_container_to_app_task(full_url, host, container, app, app_files):
+def wait_for_app_on_container_task(host, container, app):
+    run_playbooks.wait_for_app_on_container(host, container['container_name'])
 
-    app_dir = app_files['app_dir']
-    files_dir = app_files['files_dir']
-    install_script = app_files['install_script']
-    start_script = app_files['start_script']
-    stop_script = app_files['stop_script']
-    app_jar = app_files['app_jar']
 
+@shared_task
+def start_app_on_container_task(full_url, host, container, app, app_files, global_hdfs_data=None):
     bind_path = ""
     if 'disk_path' in container:
         bind_path = container['disk_path']
 
-    argument_list = [host, container['container_name'], app, app_dir, files_dir, install_script, start_script, stop_script, app_jar, bind_path]
-    error_message = "Error starting app {0} on container {1}".format(app, container['container_name'])
-    process_script("start_app_on_container", argument_list, error_message)
+    run_playbooks.start_app_on_container(host, container['container_name'], app, app_files, bind_path, global_hdfs_data)
 
 ## Start containers
 @shared_task
@@ -265,14 +586,13 @@ def start_containers_task_v2(new_containers, container_resources, disks):
         added_containers = add_containers_to_hosts(new_containers)
 
     containers_info = []
-
     for host in added_containers:
         for container in added_containers[host]:
             container_info = {}
             container_info['container_name'] = container
             container_info['host'] = host
             # Resources
-            for resource in ['cpu', 'mem', 'disk', 'energy']:
+            for resource in ['cpu', 'mem', 'disk_read', 'disk_write', 'energy']:
                 for key in ['max', 'min', 'weight', 'boundary', 'boundary_type']:
                     resource_key = '{0}_{1}'.format(resource, key)
                     if resource_key in container_resources:
@@ -280,13 +600,7 @@ def start_containers_task_v2(new_containers, container_resources, disks):
 
             if len(disks) > 0:
                 container_info['disk'] = disks[host]['name']
-                container_info['disk_path'] = disks[host]['path']
-            # # Disks
-            # for disk in disk_assignation[host]:
-            #     if disk_assignation[host][disk]['new_containers'] > 0:
-            #         disk_assignation[host][disk]['new_containers'] -= 1
-            #         container_info['disk'] = disk
-            #         container_info['disk_path'] = disk_assignation[host][disk]['disk_path']
+                container_info['disk_path'] = "/".join([disks[host]['path'], settings.VARS_CONFIG['bind_dir_name'], container])
 
             containers_info.append(container_info)
 
@@ -294,18 +608,15 @@ def start_containers_task_v2(new_containers, container_resources, disks):
         # Nothing to do
         return
 
-    hosts = ','.join(list(added_containers.keys()))
     formatted_containers_info = str(containers_info).replace(' ','')
+    run_playbooks.start_containers(list(added_containers.keys()), formatted_containers_info)
 
-    argument_list = [hosts, formatted_containers_info]
-    error_message = "Error starting containers {0}".format(formatted_containers_info)
-    process_script("start_containers", argument_list, error_message)
 
-def start_containers_with_app_task_v2(url, new_containers, app, app_files, container_resources, disk_assignation, app_type=None):
+def deploy_app_containers(url, new_containers, app, app_files, container_resources, disk_assignation, app_type=None):
 
     added_containers = {}
 
-    # update inventory file
+    # Add containers to hosts in Ansible inventory
     with redis_server.lock(lock_key):
         for host in new_containers:
             added_containers[host] = {}
@@ -313,10 +624,10 @@ def start_containers_with_app_task_v2(url, new_containers, app, app_files, conta
                 if container_type in new_containers[host]:
                     added_containers[host][container_type] = add_containers_to_hosts({host: new_containers[host][container_type]})[host]
 
+    # Format containers info to use in Ansible playbooks
     containers_info = []
-
     for host in added_containers:
-        for container_type in ['rm-nn','irregular','regular']:
+        for container_type in ['rm-nn', 'irregular', 'regular']:
             if container_type in added_containers[host]:
                 for container in added_containers[host][container_type]:
                     container_info = {}
@@ -325,7 +636,7 @@ def start_containers_with_app_task_v2(url, new_containers, app, app_files, conta
                     # Resources
                     for resource in ['cpu', 'mem']:
                         for key in ['max', 'min', 'weight', 'boundary', 'boundary_type']:
-                            resource_key = "{0}_{1}".format(resource,key)
+                            resource_key = "{0}_{1}".format(resource, key)
                             container_info[resource_key] = container_resources[container_type][resource_key]
 
                     # Energy
@@ -339,9 +650,12 @@ def start_containers_with_app_task_v2(url, new_containers, app, app_files, conta
                             if disk_assignation[host][disk]['new_containers'] > 0:
                                 disk_assignation[host][disk]['new_containers'] -= 1
                                 container_info['disk'] = disk
-                                container_info['disk_path'] = disk_assignation[host][disk]['disk_path']
-                                for resource in ['disk_max', 'disk_min', 'disk_weight', 'disk_boundary', 'disk_boundary_type']:
-                                    container_info[resource] = container_resources[container_type][resource]
+                                container_info['disk_path'] = "/".join([disk_assignation[host][disk]['disk_path'], settings.VARS_CONFIG['bind_dir_name'], container])
+                                for resource in ['disk_read', 'disk_write']:
+                                    for key in ['max', 'min', 'weight', 'boundary', 'boundary_type']:
+                                        resource_key = "{0}_{1}".format(resource,key)
+                                        container_info[resource_key] = container_resources[container_type][resource_key]
+
                                 break
 
                     containers_info.append(container_info)
@@ -350,246 +664,291 @@ def start_containers_with_app_task_v2(url, new_containers, app, app_files, conta
         # Nothing to do
         return
 
-    hosts = ','.join(list(added_containers.keys()))
-    formatted_containers_info = str(containers_info).replace(' ','')
+    formatted_containers_info = str(containers_info).replace(' ', '')
 
-    # Start containers
-    argument_list = [hosts, formatted_containers_info, app_files['app_dir'], app_files['install_script'], app_files['app_jar'], app_type]
-    error_message = "Error starting containers {0}".format(formatted_containers_info)
-    process_script("start_containers_with_app", argument_list, error_message)
+    # Deploy containers through Ansible
+    with scaling_services_disabled():
+        try:
+            run_playbooks.start_containers_with_app(list(added_containers.keys()), formatted_containers_info, app, app_type, app_files)
+        except Exception as e:
+            ## Ensure containers are removed from inventory and instances are stopped in case of failure
+            for container in containers_info:
+                stop_container(container["host"], container["container_name"])
+
+            ## Ensure app is stopped
+            change_app_state_in_db(url, app, "stopped")
+
+            ## Then, throw the original exception as the start app process must stop here
+            raise e
 
     return containers_info
 
 
 ## Start Apps
+def wait_for_app_dependency(assignation_requirements, url, app, container_resources, dependencies):
+
+    def check_space_for_app(assignation_requirements, url, container_resources, app_name):
+
+        container_resources = convert_strings_to_numbers(container_resources)
+
+        app_resources = assignation_requirements['app_resources']
+        assignation_policy = assignation_requirements['assignation_policy']
+        allow_oversubscription = assignation_requirements['allow_oversubscription']
+        number_of_containers = assignation_requirements['number_of_containers']
+        allocation_exclusions = assignation_requirements['allocation_exclusions']
+
+        # Get updated info about hosts
+        data_json = getDbData(url)
+        hosts = getHostsNames(data_json)
+
+        # Check if there is space for app
+        ## Note: this simply checks whether there are enough resources for the app across all hosts to ensure no unreasonable requests are being made
+        ## allocation may still fail when trying to assign each container to a host
+        free_resources = {}
+        for resource in app_resources:
+            free_resources[resource] = 0
+
+        for host in hosts:
+            ## Regular resources
+            for resource in set(free_resources.keys()) - {'disk_read', 'disk_write'}:
+                free_resources[resource] += host['resources'][resource]['free']
+
+            ## Disk
+            check_disks = settings.PLATFORM_CONFIG['disk_capabilities'] and settings.PLATFORM_CONFIG['disk_scaling']
+            if check_disks and 'disks' in host['resources']:
+
+                ### Remove reserved disks
+                if host['name'] in allocation_exclusions and 'disks' in allocation_exclusions[host['name']]:
+                    host['resources']['disks'] = {disk: disk_data for disk, disk_data in host['resources']['disks'].items() if disk not in allocation_exclusions[host['name']]['disks']}
+
+                for disk in host['resources']['disks']:
+                    for op in ['read', 'write']:
+                        if f'disk_{op}' in free_resources:
+                            free_resources[f'disk_{op}'] += host['resources']['disks'][disk][f'free_{op}']
+
+        if any(free_resources[resource] < app_resources[resource]['min'] - app_resources[resource]['current'] for resource in free_resources):
+            raise Exception("There is no capacity for app {0}. Requested resources: {1}. Free resources: {2}".format(app_name, app_resources, free_resources))
+
+        # Allocate the containers for each host
+        new_containers, disk_assignation, error = getContainerAssignationForApp(assignation_policy, allow_oversubscription, hosts, number_of_containers, container_resources, app_name)
+        if error != "":
+            raise Exception(error)
+
+        return new_containers, disk_assignation
+
+    if dependencies:
+        ## Check app dependency state
+        polling_period = 1
+        _, dependency_app = getDataAndFilterByApp(url, dependencies["app"])
+        continue_condition = any(dependency_app["state"] == condition for condition in dependencies["conditions"])
+
+        if not continue_condition:
+            while not continue_condition:
+                time.sleep(polling_period)
+                _, dependency_app = getDataAndFilterByApp(url, dependencies["app"])
+                continue_condition = any(dependency_app["state"] == condition for condition in dependencies["conditions"])
+
+            time.sleep(60) ## wait a bit before running app if the dependency condition was just met
+
+    new_containers, disk_assignation = check_space_for_app(assignation_requirements, url, container_resources, app)
+
+    return new_containers, disk_assignation
+
+def rollback_start_flow(url, app, app_containers, app_files):
+    if app_containers:
+        for container in app_containers:
+            try:
+                run_playbooks.stop_app_on_container(container['host'], container['container_name'], app, app_files,
+                                                    rm_container="", bind_path=container.get('disk_path', ''))
+            except Exception as e:
+                print("[ROLLBACK] Error stopping aplication {0} inside container {1}: {2}".format(app, container['container_name'], str(e)))
+
+        for container in app_containers:
+            try:
+                stop_container(container['host'], container['container_name'], container.get('disk_path', ''))
+            except Exception as e:
+                print("[ROLLBACK] Error removing container {0} from remote host {1}: {2}".format(container['container_name'], container["host"], str(e)))
+
+        for container in app_containers:
+            try:
+                full_url = url + "container/{0}/{1}".format(container['container_name'], app)
+                remove_container_from_app_db(full_url, container['container_name'], app)
+            except Exception as e:
+                print("[ROLLBACK] Error removing container {0} from StateDatabase: {1}".format(container['container_name'], str(e)))
+
+    try:
+        change_app_state_in_db(url, app, "stopped")
+    except Exception as e:
+        print("[ROLLBACK] Error changing application {0} state to stopped: {1}".format(app, str(e)))
+
+    try:
+        manage_scaling_services(enable=True)
+    except Exception as e:
+        print("[ROLLBACK] Error changing enabling Scaler: {0}".format(str(e)))
+
+
 @shared_task(bind=True)
-def start_app_task(self, url, app, app_files, new_containers, container_resources, disk_assignation, scaler_polling_freq, app_type=None):
+def start_app_task(self, assignation_requirements, url, app, app_files, container_resources, scaler_polling_freq, app_type=None, dependencies={}):
+
+    new_containers, disk_assignation = wait_for_app_dependency(assignation_requirements, url, app, container_resources, dependencies)
+
+    if settings.PLATFORM_CONFIG['enable_app_callback']:
+        ## Create redis counter to track the containers' status
+        create_app_counter(app, assignation_requirements['number_of_containers'])
 
     start_time = timeit.default_timer()
 
-    app_containers = start_containers_with_app_task_v2(url, new_containers, app, app_files, container_resources, disk_assignation, app_type)
-    setup_containers_network_task(app_containers, url, app, app_files, new_containers)
+    # Set application in running state in ServerlessContainers
+    change_app_state_in_db(url, app, "running")
 
-    end_time = timeit.default_timer()
-    runtime = "{:.2f}".format(end_time-start_time)
-    update_task_runtime(self.request.id, runtime)
+    app_containers = None
+    try:
+        # Deploy all the containers in the remote hosts
+        app_containers = deploy_app_containers(url, new_containers, app, app_files, container_resources, disk_assignation, app_type)
 
-    remove_containers_from_app(url, app_containers, app, app_files, scaler_polling_freq)
+        # Setup containers network to enable communications between containers
+        setup_containers_network_task(url, app, app_containers, new_containers)
+
+        # Start app inside all the containers
+        start_app_on_containers(url, app, app_containers, app_files)
+
+    except Exception as e:
+        rollback_start_flow(url, app, app_containers, app_files)
+        raise e
+
+    if not settings.PLATFORM_CONFIG['enable_app_callback']:
+        # Wait for app to finish in all the containers
+        wait_for_app_on_containers(app, app_containers)
+
+        end_time = timeit.default_timer()
+        runtime = "{:.2f}".format(end_time-start_time)
+        update_task_runtime(self.request.id, runtime)
+
+        # Destroy all the containers and remove them from ServerlessContainers
+        remove_containers_from_app(url, app_containers, app, app_files)
 
 @shared_task(bind=True)
-def start_hadoop_app_task(self, url, app, app_files, new_containers, container_resources, disk_assignation, scaler_polling_freq, virtual_cluster, app_type="hadoop_app"):
+def start_hadoop_app_task(self, assignation_requirements, url, app, app_files, container_resources, scaler_polling_freq, virtual_cluster, app_type="hadoop_app", global_hdfs_data=None, dependencies={}):
+
+    new_containers, disk_assignation = wait_for_app_dependency(assignation_requirements, url, app, container_resources, dependencies)
+
+    if settings.PLATFORM_CONFIG['enable_app_callback']:
+        raise Exception("Callback app execution not currently supported by hadoop apps")
+
+    ## Create redis counter to track the containers' status
+    create_app_counter(app, 1)
 
     # Calculate resources for Hadoop cluster
     hadoop_resources = {}
     for container_type in ["regular", "irregular"]:
         # NOTE: 'irregular' container won't be created due to a previous workaround
         if container_type in container_resources:
-            hadoop_resources[container_type] = {}
 
-            total_cores = max(int(container_resources[container_type]["cpu_max"])//100,1)
-            min_cores = max(int(container_resources[container_type]["cpu_min"])//100,1)
-            total_memory = int(container_resources[container_type]["mem_max"])
-            total_disks = 1
-            heapsize_factor = 0.9
-
-            ## 'Classic' way of calculating resources:
-            #reserved_memory = get_node_reserved_memory(total_memory)
-            #available_memory = total_memory - reserved_memory
-            #min_container_size = get_min_container_size(total_memory)
-
-            #number_of_hadoop_containers = int(min(2*total_cores, 1.8*total_disks, available_memory/min_container_size))
-            # mem_per_container = max(min_container_size, available_memory/number_of_hadoop_containers)
-
-            # scheduler_maximum_memory = int(number_of_hadoop_containers * mem_per_container)
-            # scheduler_minimum_memory = int(mem_per_container)
-            # nodemanager_memory = scheduler_maximum_memory
-            # map_memory = scheduler_minimum_memory
-            # reduce_memory = int(min(2*mem_per_container, available_memory))
-            # mapreduce_am_memory = reduce_memory
-
-
-            ## 'BDEv' way of calculating resources:
-            #number_of_hadoop_containers = int(min(2*total_cores, available_memory/min_container_size))
-
-            if virtual_cluster:
-                ## Virtual cluster config (test environment with low resources)
-                hyperthreading = False
-                app_master_heapsize = 128
-                datanode_d_heapsize = 128
-                nodemanager_d_heapsize = 128
-            else:
-                ## Physical cluster config (real environment with (presumably) high resources)
-                hyperthreading = True
-                app_master_heapsize = 1024
-                datanode_d_heapsize = 1024
-                nodemanager_d_heapsize = 1024
-
-            ## adjust total_cores to hyperthreading system
-            ## TODO: check if system actually has hyperthreading
-            if hyperthreading:
-                total_cores = total_cores // 2
-
-            app_master_memory_overhead = int(app_master_heapsize * 0.1)
-            if app_master_memory_overhead < 384:
-                app_master_memory_overhead = 384
-            mapreduce_am_memory = app_master_heapsize + app_master_memory_overhead
-
-            memory_per_container_factor = 0.95
-            available_memory = int(total_memory * memory_per_container_factor)
-            nodemanager_memory = available_memory - nodemanager_d_heapsize - datanode_d_heapsize
-
-            mem_per_container = int((nodemanager_memory - mapreduce_am_memory) / total_cores)
-
-            map_memory_ratio = 1
-            reduce_memory_ratio = 1
-            map_memory = int(min(mem_per_container * map_memory_ratio, available_memory))
-            reduce_memory = int(min(mem_per_container * reduce_memory_ratio, available_memory))
-
-            scheduler_maximum_memory = nodemanager_memory
-            #scheduler_minimum_memory = int(mem_per_container)
-            scheduler_minimum_memory = 256
-
-            total_available_memory = 0
+            number_of_workers = 0
             for host in new_containers:
-                if container_type in new_containers[host]:
-                    total_available_memory += available_memory * new_containers[host][container_type]
+                if container_type in new_containers[host]: number_of_workers += new_containers[host][container_type]
 
-            if total_available_memory < map_memory + reduce_memory + mapreduce_am_memory:
-                memory_slice = nodemanager_memory/3.5
-                scheduler_minimum_memory = int(memory_slice)
-                map_memory = scheduler_minimum_memory
-                reduce_memory = scheduler_minimum_memory
-                mapreduce_am_memory = int(1.5 * memory_slice)
-
-            map_memory_java_opts = int(heapsize_factor * map_memory)
-            reduce_memory_java_opts = int(heapsize_factor * reduce_memory)
-            #mapreduce_am_memory_java_opts = int(heapsize_factor * mapreduce_am_memory)
-            mapreduce_am_memory_java_opts = app_master_heapsize
-
-            hadoop_resources[container_type]["vcores"] = str(total_cores)
-            hadoop_resources[container_type]["min_vcores"] = str(min_cores)
-            hadoop_resources[container_type]["scheduler_maximum_memory"] = str(scheduler_maximum_memory)
-            hadoop_resources[container_type]["scheduler_minimum_memory"] = str(scheduler_minimum_memory)
-            hadoop_resources[container_type]["nodemanager_memory"] = str(nodemanager_memory)
-            hadoop_resources[container_type]["map_memory"] = str(map_memory)
-            hadoop_resources[container_type]["map_memory_java_opts"] = str(map_memory_java_opts)
-            hadoop_resources[container_type]["reduce_memory"] = str(reduce_memory)
-            hadoop_resources[container_type]["reduce_memory_java_opts"] = str(reduce_memory_java_opts)
-            hadoop_resources[container_type]["mapreduce_am_memory"] = str(mapreduce_am_memory)
-            hadoop_resources[container_type]["mapreduce_am_memory_java_opts"] = str(mapreduce_am_memory_java_opts)
-            hadoop_resources[container_type]["datanode_d_heapsize"] = str(datanode_d_heapsize)
-            hadoop_resources[container_type]["nodemanager_d_heapsize"] = str(nodemanager_d_heapsize)
-
-            # Check assigned resources are valid
-            for resource in hadoop_resources[container_type]:
-                value = int(hadoop_resources[container_type][resource])
-                if value <= 0:
-                    bottleneck_resource = "CPU" if resource in ["vcores", "min_vcores"] else "memory"
-                    raise Exception("Error allocating resources for containers in Hadoop application. "
-                                    "Value for '{0}' is negative ({1}). The application may have been assigned "
-                                    "too low {2} values.".format(resource, value, bottleneck_resource))
+            replication_factor = settings.PLATFORM_CONFIG['local_hdfs_replication'] if settings.PLATFORM_CONFIG['hdfs_mode'] != 'single' else settings.PLATFORM_CONFIG['global_hdfs_replication']
+            hadoop_resources[container_type] = set_hadoop_resources(container_resources[container_type], virtual_cluster, number_of_workers, replication_factor=replication_factor)
 
     start_time = timeit.default_timer()
 
-    app_containers = start_containers_with_app_task_v2(url, new_containers, app, app_files, container_resources, disk_assignation, app_type)
-    rm_host, rm_container = setup_containers_hadoop_network_task(app_containers, url, app, app_files, hadoop_resources, new_containers, app_type)
+    # Set application in running state in ServerlessContainers
+    change_app_state_in_db(url, app, "running")
+
+    app_containers = deploy_app_containers(url, new_containers, app, app_files, container_resources, disk_assignation, app_type)
+    rm_host, rm_container, download_time, upload_time = setup_containers_hadoop_network_task(app_containers, url, app, app_files, hadoop_resources, new_containers, app_type, global_hdfs_data)
 
     end_time = timeit.default_timer()
     runtime = "{:.2f}".format(end_time-start_time)
     update_task_runtime(self.request.id, runtime)
 
     # Stop hadoop cluster
-    argument_list = [rm_host, rm_container]
-    error_message = "Error stopping hadoop cluster for app {0}".format(app)
-    process_script("stop_hadoop_cluster", argument_list, error_message)
+    run_playbooks.stop_hadoop_cluster(rm_host, rm_container)
 
-    ## Disable scaler, remove all containers from StateDB and re-enable scaler
-    argument_list = []
-    error_message = "Error disabling scaler"
-    process_script("disable_scaler", argument_list, error_message)
+    ## Disable scaler and other scaling services, remove all containers from StateDB and re-enable them
+    with scaling_services_disabled():
+        start_time = timeit.default_timer()
+        errors = []
+        for container in app_containers:
+            full_url = url + "container/{0}/{1}".format(container['container_name'],app)
+            error = remove_container_from_app_db(full_url, container['container_name'], app)
+            if error != "": errors.append(error)
+        end_time = timeit.default_timer()
 
-    start_time = timeit.default_timer()
-    errors = []
-    for container in app_containers:
-        full_url = url + "container/{0}/{1}".format(container['container_name'],app)
-        error = remove_container_from_app_db(full_url, container['container_name'], app)
-        if error != "": errors.append(error)
-    end_time = timeit.default_timer()
+        ## Wait at least for the scaler polling frequency time before re-enabling it
+        time.sleep(scaler_polling_freq - (end_time - start_time))
 
-    ## Wait at least for the scaler polling frequency time before re-enabling it
-    time.sleep(scaler_polling_freq - (end_time - start_time))
-
-    argument_list = []
-    error_message = "Error re-enabling scaler"
-    process_script("enable_scaler", argument_list, error_message)
-
-    ## Stop Containers
-    # Remove master container first
-    for container in app_containers:
-        if container['container_name'] == rm_container:
-            full_url = url + "container/{0}/{1}".format(rm_container,app)
-            bind_path = ""
-            if 'disk_path' in container: bind_path = container['disk_path']
-            stop_app_on_container_task(rm_host, rm_container, bind_path, app, app_files, rm_container)
-            break
+    ## Get timestamp to store output data
+    timestamp = None
+    if 'output_dir' in app_files and app_files['output_dir'] != '':
+        timestamp = time.strftime("%Y-%m-%d--%H-%M-%S")
 
     # Stop and remove containers
-    stop_containers_task = []
     for container in app_containers:
-        if container['container_name'] != rm_container:
-            full_url = url + "container/{0}/{1}".format(container['container_name'],app)
-            bind_path = ""
-            if 'disk_path' in container: bind_path = container['disk_path']
-            stop_task = stop_app_on_container_task.si(container['host'], container['container_name'], bind_path, app, app_files, rm_container)
-            stop_containers_task.append(stop_task)
+        full_url = url + "container/{0}/{1}".format(container['container_name'],app)
+        bind_path = ""
+        if 'disk_path' in container: bind_path = container['disk_path']
+        if container['container_name'] == rm_container:
+            stop_task = stop_app_on_container_task.delay(container['host'], container['container_name'], bind_path, app, app_files, rm_container, timestamp, download_time, upload_time)
+        else:
+            stop_task = stop_app_on_container_task.delay(container['host'], container['container_name'], bind_path, app, app_files, rm_container, timestamp)
+        register_task(stop_task.id,"stop_container_task")
 
-    set_hadoop_logs_timestamp_task = set_hadoop_logs_timestamp.si(app, app_files, rm_host, rm_container)
-    log_task = chord(stop_containers_task)(set_hadoop_logs_timestamp_task)
-    register_task(log_task.id,"stop_containers_task")
+    # Set application in running state in ServerlessContainers
+    change_app_state_in_db(url, app, "stopped")
 
     if len(errors) > 0: raise Exception(str(errors))
 
+
 @shared_task
-def set_hadoop_logs_timestamp(app, app_files, rm_host, rm_container):
-
-    argument_list = [app_files['app_jar'], rm_host, rm_container]
-    error_message = "Error setting timestamp for hadoop logs for app {0}".format(app)
-    process_script("set_hadoop_logs_timestamp", argument_list, error_message)
-
-## Setup network for apps
-@shared_task
-def setup_containers_network_task(app_containers, url, app, app_files, new_containers):
-
+def setup_containers_network_task(url, app, app_containers, new_containers):
+    # Setup networks for a group of containers belonging to the same app
     # app_containers example = [{'container_name':'host1-cont0','host':'host1','cpu_max':200,'disk':'ssd_0',...},{'container_name':'host2-cont0','host':'host2',...}]
-    hosts = ','.join(list(new_containers.keys()))
-    formatted_app_containers = str(app_containers).replace(' ','')
+    formatted_app_containers = str(app_containers).replace(' ', '')
+    run_playbooks.setup_network_on_containers(list(new_containers.keys()), formatted_app_containers, app)
 
-    argument_list = [hosts, formatted_app_containers]
-    error_message = "Error setting network for app {0}".format(app)
-    process_script("setup_network_on_containers", argument_list, error_message)
+@shared_task
+def subscribe_containers_to_app(url, app, app_containers):
+    with scaling_services_disabled():
+        # Subscribe containers to app in ServerlessContainers database
+        for container in app_containers:
+            full_url = url + "container/{0}/{1}".format(container['container_name'], app)
+            add_container_to_app_in_db(full_url, container['container_name'], app)
 
-    # Add containers to app
+@shared_task
+def wait_for_app_on_containers(app, app_containers):
+    # Create a task for each container in charge of starting the app inside them
+    tasks = []
+    for container in app_containers:
+        wait_task = wait_for_app_on_container_task.si(container['host'], container, app)
+        tasks.append(wait_task)
+
+    result = group(tasks)()
+    while not result.ready():
+        time.sleep(1)
+    result.get()
+
+
+@shared_task
+def start_app_on_containers(url, app, app_containers, app_files):
+    # Create a task for each container in charge of starting the app inside them
+    tasks = []
     for container in app_containers:
         full_url = url + "container/{0}/{1}".format(container['container_name'], app)
-        add_container_to_app_in_db(full_url, container['container_name'], app)
+        start_task = start_app_on_container_task.si(full_url, container['host'], container, app, app_files)
+        tasks.append(start_task)
 
-    # Start app on containers
-    start_containers_task = []
-    for container in app_containers:
-        full_url = url + "container/{0}/{1}".format(container['container_name'],app)
-        start_task = add_container_to_app_task.si(full_url, container['host'], container, app, app_files)
-        start_containers_task.append(start_task)
-
-    start_group_task = group(start_containers_task)
-
-    task = start_group_task()
-    while not task.ready():
+    result = group(tasks)()
+    while not result.ready():
         time.sleep(1)
-    task.get()
+    result.get()
 
 
 @shared_task
-def setup_containers_hadoop_network_task(app_containers, url, app, app_files, hadoop_resources, new_containers, app_type="hadoop_app"):
+def setup_containers_hadoop_network_task(app_containers, url, app, app_files, hadoop_resources, new_containers, app_type="hadoop_app", global_hdfs_data=None):
+
+    app_files['app_type'] = app_type
 
     # Get rm-nn container (it is the first container from the host that got that container)
     for host in new_containers:
@@ -603,57 +962,253 @@ def setup_containers_hadoop_network_task(app_containers, url, app, app_files, ha
             break
 
     # app_containers example = [{'container_name':'host1-cont0','host':'host1','cpu_max':200,'disk':'ssd_0',...},{'container_name':'host2-cont0','host':'host2',...}]
-    hosts = ','.join(list(new_containers.keys()))
     formatted_app_containers = str(app_containers).replace(' ','')
 
-    # NOTE: 'irregular' container won't be created due to a previous workaround
-    vcores = hadoop_resources["regular"]["vcores"]
-    min_vcores = hadoop_resources["regular"]["min_vcores"]
-    scheduler_maximum_memory = hadoop_resources["regular"]["scheduler_maximum_memory"]
-    scheduler_minimum_memory = hadoop_resources["regular"]["scheduler_minimum_memory"]
-    nodemanager_memory = hadoop_resources["regular"]["nodemanager_memory"]
-    map_memory = hadoop_resources["regular"]["map_memory"]
-    map_memory_java_opts = hadoop_resources["regular"]["map_memory_java_opts"]
-    reduce_memory = hadoop_resources["regular"]["reduce_memory"]
-    reduce_memory_java_opts = hadoop_resources["regular"]["reduce_memory_java_opts"]
-    mapreduce_am_memory = hadoop_resources["regular"]["mapreduce_am_memory"]
-    mapreduce_am_memory_java_opts = hadoop_resources["regular"]["mapreduce_am_memory_java_opts"]
-    datanode_d_heapsize = hadoop_resources["regular"]["datanode_d_heapsize"]
-    nodemanager_d_heapsize =  hadoop_resources["regular"]["nodemanager_d_heapsize"]
-
-    argument_list = [hosts, app, app_type, formatted_app_containers, rm_host, rm_container['container_name'],
-        vcores, min_vcores, scheduler_maximum_memory, scheduler_minimum_memory, nodemanager_memory,
-        map_memory, map_memory_java_opts, reduce_memory, reduce_memory_java_opts, mapreduce_am_memory,
-        mapreduce_am_memory_java_opts, datanode_d_heapsize, nodemanager_d_heapsize]
-
-    error_message = "Error setting network for app {0}".format(app)
-    process_script("setup_hadoop_network_on_containers", argument_list, error_message)
-
-    # Add containers to app
-    for container in app_containers:
-        full_url = url + "container/{0}/{1}".format(container['container_name'], app)
-        add_container_to_app_in_db(full_url, container['container_name'], app)
+    download_time, upload_time = 0,0
+    if not global_hdfs_data:
+        run_playbooks.setup_hadoop_network_on_containers(list(new_containers.keys()), app, app_files, formatted_app_containers, rm_host, rm_container['container_name'], hadoop_resources["regular"])
+    else:
+        ## Download required input data from global HDFS to local one
+        if "global_input" in  global_hdfs_data and global_hdfs_data["global_input"] != "":
+            change_app_state_in_db(url, app, "hdfs_downloading")
+        download_time = run_playbooks.setup_hadoop_network_with_global_hdfs(list(new_containers.keys()), app, app_files, formatted_app_containers, rm_host, rm_container['container_name'], hadoop_resources["regular"], global_hdfs_data)
+        if "global_input" in  global_hdfs_data and global_hdfs_data["global_input"] != "":
+            change_app_state_in_db(url, app, "running")
 
     # Lastly, start app on RM container
     full_url = url + "container/{0}/{1}".format(rm_container['container_name'],app)
-    add_container_to_app_task(full_url, rm_host, rm_container, app, app_files)
+    start_app_on_container_task(full_url, rm_host, rm_container, app, app_files, global_hdfs_data)
 
-    return rm_host, rm_container['container_name']
+    # Wait for RM container to finish
+    wait_for_app_on_container_task(rm_host, rm_container, app)
+
+    if global_hdfs_data:
+        ## Upload generated output data from local HDFS to global one
+        change_app_state_in_db(url, app, "hdfs_uploading")
+        upload_time = run_playbooks.upload_local_hdfs_data_to_global(rm_host, rm_container['container_name'], global_hdfs_data, formatted_app_containers)
+
+    return rm_host, rm_container['container_name'], download_time, upload_time
+
+@shared_task(bind=True)
+def create_dir_on_hdfs(self, namenode_host, namenode_container, dir_to_create):
+    run_playbooks.create_dir_on_hdfs(namenode_host, namenode_container, dir_to_create)
+
+@shared_task(bind=True)
+def add_file_to_hdfs(self, namenode_host, namenode_container, file_to_add, dest_path):
+    if settings.PLATFORM_CONFIG["server_as_host"]:
+        frontend_container = namenode_container
+    else:
+        frontend_container = settings.VARS_CONFIG["hdfs_frontend_container_name"]
+
+    run_playbooks.add_file_to_hdfs(namenode_host, namenode_container, file_to_add, dest_path, frontend_container)
+
+@shared_task(bind=True)
+def get_file_from_hdfs(self, namenode_host, namenode_container, file_to_download, dest_path):
+    if settings.PLATFORM_CONFIG["server_as_host"]:
+        frontend_container = namenode_container
+    else:
+        frontend_container = settings.VARS_CONFIG["hdfs_frontend_container_name"]
+
+    run_playbooks.get_file_from_hdfs(namenode_host, namenode_container, file_to_download, dest_path, frontend_container)
+
+@shared_task(bind=True)
+def remove_file_from_hdfs(self, namenode_host, namenode_container, path_to_delete):
+    run_playbooks.remove_file_from_hdfs(namenode_host, namenode_container, path_to_delete)
+
+@shared_task(bind=True)
+def monitor_global_hdfs_replication(self, global_app_name, global_namenode_host, global_namenode_name):
+
+    from ui.views.core.utils import getHostsNames
+    def reload_db_info(global_app_url, global_namenode_url):
+        ## Global app
+        global_app = getDbData(global_app_url)
+        global_namenode = getDbData(global_namenode_url)
+
+        ## Hosts
+        if global_app and "disk" in global_app["resources"]:
+            data_json = getDbData("/".join([settings.BASE_URL, "structure", ""])) ## the url needs to end with "/"
+            hosts = getHostsNames(data_json)
+
+        return global_app, global_namenode, hosts
+
+    ## TODO: make the polling frequency and thresholds dynamically configurable variables from the interface
+    polling_frequency = 30
+    threshold = 0.15
+    read_threshold = threshold
+    write_threshold = threshold
+
+    global_app_url = "/".join([settings.BASE_URL, "structure", global_app_name ])
+    global_namenode_url = "/".join([settings.BASE_URL, "structure", global_namenode_name ])
+
+    ## HDFS has just started, wait until next polling period
+    time.sleep(polling_frequency)
+
+    ## Reload DB info
+    global_app, global_namenode, hosts = reload_db_info(global_app_url, global_namenode_url)
+
+    ## Get disks used by global HDFS
+    datanode_list = {}
+    if global_app and "disk" in global_app["resources"]:
+        for host in hosts:
+            datanode_list[host['name']] = []
+
+        for container_name in global_app['containers']:
+            if container_name != global_namenode_name:
+                container = getDbData("/".join([settings.BASE_URL, "structure", container_name ]))
+                if "disk" in container['resources']:
+                    datanode_list[container['host']].append(container)
+
+    ## Loop until global HDFS is stopped
+    while bool(global_app) and bool(global_namenode) and global_namenode['name'] in global_app['containers']:
+
+        run_replication = True
+        for host in hosts:
+            for datanode in datanode_list[host['name']]:
+                match_disk = None
+                for host_disk in host['resources']['disks']:
+                    if host_disk == datanode['resources']['disk']['name']:
+                        match_disk = host['resources']['disks'][host_disk]
+                        break
+                if not match_disk: raise Exception("Disk {0} not found in host {1}. Host data: {2}".format(datanode['resources']['disk']['name'], host['name'], host))
+                if any(
+                    (match_disk[f'max_{res}'] - datanode['resources'][f"disk_{res}"]['min']) * thresh < match_disk[f'max_{res}'] - datanode['resources'][f"disk_{res}"]['min'] - match_disk[f'free_{res}'] 
+                    or global_app["resources"][f"disk_{res}"]["max"] * thresh < global_app["resources"][f"disk_{res}"]["usage"] 
+                    for res, thresh in [("read", read_threshold), ("write", write_threshold)]
+                ):
+                    run_replication = False
+                    break
+
+        if run_replication:
+            ## Check all app usage for that
+            ## Enforce HDFS replication only if global cluster has low I/O usage (at least below the threshold)
+            run_playbooks.set_global_hdfs_replication(global_namenode_host, global_namenode_name, settings.PLATFORM_CONFIG['global_hdfs_replication'])
+
+        time.sleep(polling_frequency)
+        global_app, global_namenode, hosts = reload_db_info(global_app_url, global_namenode_url)
+
+@shared_task(bind=True)
+def start_global_hdfs_task(self, url, app, app_files, containers, virtual_cluster, put_field_data, hosts):
+
+    # Calculate resources for HDFS cluster
+    number_of_workers = len(containers) - 1
+
+    worker_resources = None
+    for container in containers:
+        if "datanode" in container['container_name']:
+            worker_resources = container
+            break
+    if not worker_resources: raise Exception("Worker container not found when starting global hdfs: {0}".format(containers))
+
+    hdfs_resources = set_hadoop_resources(worker_resources, virtual_cluster, number_of_workers, replication_factor=settings.PLATFORM_CONFIG['global_hdfs_replication'])
+
+    start_time = timeit.default_timer()
+
+    ## Create HDFS app
+    add_app_task(url, put_field_data, app, app_files)
+
+    ## Create and start containers
+    # update inventory file
+    with redis_server.lock(lock_key):
+        add_containers_to_inventory(containers)
+
+    nn_container = None
+    nn_host = None
+    for container in containers:
+        if "namenode" in container['container_name']:
+            nn_container = container['container_name']
+            nn_host = container['host']
+            if settings.PLATFORM_CONFIG["server_as_host"]:
+                # Set additional variables to this specific container
+                ## 'secondary_bind' --> bind directory that will be used to transfer data from local system to global HDFS
+                ## 'expose_ptp' --> expose ptp as primary network connection to allow communication from server to namenode
+                ## 'portmap' --> port mapping to allow direct communication from server to namenode
+                container['expose_ptp'] = 1
+                container['portmap'] = "portmap={0}:{1}/tcp".format(settings.PLATFORM_CONFIG['local_namenode_port'], settings.PLATFORM_CONFIG['namenode_port'])
+            break
+    if not nn_container: raise Exception("Namenode container not found in container list") # should not happen
+
+    host_list = []
+    for host in hosts: host_list.append(host['name'])
+    formatted_containers_info = str(containers).replace(' ','')
+
+    # Start containers
+    with scaling_services_disabled():
+        run_playbooks.start_containers_with_app(host_list, formatted_containers_info, app, app_files['app_type'], app_files)
+
+    ## Setup network and start HDFS
+    # Run HDFS + YARN on the global HDFS cluster, thus distcp may be run within the global cluster
+    start_zookeeper = settings.PLATFORM_CONFIG['hdfs_mode'] == 'rbf'
+    run_playbooks.setup_hadoop_network_on_containers(host_list, app, app_files, formatted_containers_info, nn_host, nn_container, hdfs_resources, start_zookeeper=start_zookeeper)
+
+    # Start hdfs frontend container
+    if not settings.PLATFORM_CONFIG["server_as_host"]:
+        run_playbooks.start_hdfs_frontend(host_list, "hdfs_frontend", formatted_containers_info, nn_host, nn_container)
+
+    ## Run the replication factor monitor
+    if settings.PLATFORM_CONFIG["hdfs_replication_mode"] == "monitor":
+        monitor_task = monitor_global_hdfs_replication.delay(app, nn_host, nn_container)
+        register_task(monitor_task.id,"monitor_hdfs_task")
+
+    end_time = timeit.default_timer()
+    runtime = "{:.2f}".format(end_time-start_time)
+    update_task_runtime(self.request.id, runtime)
+
+@shared_task(bind=True)
+def stop_hdfs_task(self, url, app, app_files, app_containers, scaler_polling_freq, rm_host, rm_container):
+
+    # Stop hadoop cluster
+    run_playbooks.stop_hadoop_cluster(rm_host, rm_container)
+
+    ## Disable scaler and other scaling services, remove all containers from StateDB and re-enable them
+    with scaling_services_disabled():
+        start_time = timeit.default_timer()
+        errors = []
+        for container in app_containers:
+            full_url = url + "container/{0}/{1}".format(container['name'],app)
+            error = remove_container_from_app_db(full_url, container['name'], app)
+            if error != "": errors.append(error)
+        end_time = timeit.default_timer()
+
+        ## Wait at least for the scaler polling frequency time before re-enabling it
+        time.sleep(scaler_polling_freq - (end_time - start_time))
+
+    # Remove app from db
+    full_url = url + "apps" + "/" + app
+    error_message = "Error removing app {0}".format(app)
+    error, _ = web_request(full_url, "delete", error_message)
+
+    ## Clean datanodes data_dir and avoid errors when creating new global_hdfs cluster
+    ## This is a workaround, should be executed when stopping cluster
+    for container in app_containers:
+        run_playbooks.clean_hdfs(container['host'], container['name'])
+
+    # Stop hdfs frontend container
+    if not settings.PLATFORM_CONFIG["server_as_host"]:
+        run_playbooks.stop_container("platform_server", vars_config['hdfs_frontend_container_name'])
+
+    # Stop containers
+    for container in app_containers:
+        bind_path, clean_bind_dir = "", True
+        if 'disk' in container['resources'] and 'path' in container['resources']['disk']:
+            bind_path = container['resources']['disk']['path']
+        if "namenode" in container['name']:
+            clean_bind_dir = False
+
+        stop_task = stop_container.delay(container['host'], container['name'], bind_path, clean_bind_dir)
+        register_task(stop_task.id,"stop_container_task")
+
 
 ## Removes
 @shared_task
 def remove_host_task(full_url, host_name):
 
     error_message = "Error removing host {0}".format(host_name)
-    error, _ = request_to_state_db(full_url, "delete", error_message)
+    error, _ = web_request(full_url, "delete", error_message)
 
-    ## remove host
-    if (not error):
-            
-        # stop node scaler service in host
-        argument_list = [host_name]
-        error_message = "Error stopping host {0} scaler service".format(host_name)
-        process_script("stop_host_scaler", argument_list, error_message)
+    ## Remove host
+    if not error:
+        # Stop node scaler service in host
+        run_playbooks.stop_host_scaler(host_name)
 
         # update inventory file
         with redis_server.lock(lock_key):
@@ -662,115 +1217,133 @@ def remove_host_task(full_url, host_name):
         raise Exception(error)
 
 @shared_task
-def remove_app_task(url, structure_type_url, app_name, container_list, app_files):
+def remove_app_task(url, structure_type_url, app_name, container_list, app_files, user=None):
 
-    # first, remove all containers from app
+    # First, remove all containers from app
     if len(container_list) > 0:
-        argument_list = []
-        error_message = "Error disabling scaler"
-        process_script("disable_scaler", argument_list, error_message)
+        with scaling_services_disabled():
+            errors = []
+            for container in container_list:
+                full_url = url + "container/{0}/{1}".format(container['name'], app_name)
+                error = remove_container_from_app_db(full_url, container['name'], app_name)
+                if error != "": errors.append(error)
 
-        errors = []
-        for container in container_list:
-            full_url = url + "container/{0}/{1}".format(container['name'], app_name)
-            error = remove_container_from_app_db(full_url, container['name'], app_name)
-            if error != "": errors.append(error)
-
-        argument_list = []
-        error_message = "Error re-enabling scaler"
-        process_script("enable_scaler", argument_list, error_message)
+        ## Get timestamp to store output data
+        timestamp = None
+        if 'output_dir' in app_files and app_files['output_dir'] != '':
+            timestamp = time.strftime("%Y-%m-%d--%H-%M-%S")
 
         for container in container_list:
             full_url = url + "container/{0}/{1}".format(container['name'], app_name)
-            bind_path = ""
-            if 'disk_path' in container: bind_path = container['disk_path']
-            task = stop_app_on_container_task.delay(container['host'], container['name'], bind_path, app_name, app_files, "")
+            bind_path = container.get('disk_path', "")
+            task = stop_app_on_container_task.delay(container['host'], container['name'], bind_path, app_name, app_files, "", timestamp)
             register_task(task.id, "stop_app_on_container_task")
 
-    # then, actually remove app
+    # If app is associated with a user, desubscribe app from user
+    if user and user != "":
+        full_url = settings.BASE_URL + "/user/clusters/" + user + "/" + app_name + "/"
+        error_message = "Error removing app {0} from user {1}".format(app_name, user)
+        error, _ = web_request(full_url, "delete", error_message)
+
+        if error:
+            raise Exception(error)
+
+    # Then, actually remove app
     full_url = url + structure_type_url + "/" + app_name
 
     error_message = "Error removing app {0}".format(app_name)
-    error, _ = request_to_state_db(full_url, "delete", error_message)
-
-    if (error): raise Exception(error)
+    error, _ = web_request(full_url, "delete", error_message)
 
 @shared_task
-def remove_containers(url, container_list):
+def remove_containers_task(url, container_list):
 
-    ## Disable scaler, remove all containers from StateDB and re-enable scaler
-    argument_list = []
-    error_message = "Error disabling scaler"
-    process_script("disable_scaler", argument_list, error_message)
+    ## Disable scaler and other scaling services, remove all containers from StateDB and re-enable them
+    with scaling_services_disabled():
+        # Ensure Scaler finish current iteration and persist host info before removing containers
+        # Sleep is not needed because orchestrator will do safe updated
+        #time.sleep(scaler_polling_freq)
 
-    errors = []
-    for container in container_list:
-        full_url = url + "container/{0}".format(container['container_name'])
-        error = remove_container_from_db(full_url, container['container_name'])
-        if error != "": errors.append(error)
+        errors = []
+        for container in container_list:
+            full_url = url + "container/{0}".format(container['name'])
+            error = remove_container_from_db(full_url, container['name'])
+            if error != "": errors.append(error)
 
-    argument_list = []
-    error_message = "Error re-enabling scaler"
-    process_script("enable_scaler", argument_list, error_message)
 
     ## Stop Containers
     # Stop and remove containers
     for container in container_list:
-        full_url = url + "container/{0}".format(container['container_name'])
-        stop_task = stop_container.delay(container['host'], container['container_name'])
-        register_task(stop_task.id,"stop_container_task")
-
-    # It would be great to execute tasks on a group, but the group task ID is not trackable
-
-    if len(errors) > 0: raise Exception(str(errors))
-
-@shared_task
-def remove_containers_from_app(url, container_list, app, app_files, scaler_polling_freq):
-
-    ## Disable scaler, remove all containers from StateDB and re-enable scaler
-    argument_list = []
-    error_message = "Error disabling scaler"
-    process_script("disable_scaler", argument_list, error_message)
-
-    start_time = timeit.default_timer()
-    errors = []
-    for container in container_list:
-        full_url = url + "container/{0}/{1}".format(container['container_name'],app)
-        error = remove_container_from_app_db(full_url, container['container_name'], app)
-        if error != "": errors.append(error)
-    end_time = timeit.default_timer()
-
-    ## Wait at least for the scaler polling frequency time before re-enabling it
-    time.sleep(scaler_polling_freq - (end_time - start_time))
-
-    argument_list = []
-    error_message = "Error re-enabling scaler"
-    process_script("enable_scaler", argument_list, error_message)
-
-    ## Stop Containers
-    # Stop and remove containers
-    #stop_containers_task = []
-    for container in container_list:
-        full_url = url + "container/{0}/{1}".format(container['container_name'],app)
+        full_url = url + "container/{0}".format(container['name'])
         bind_path = ""
-        if 'disk_path' in container: bind_path = container['disk_path']
-        stop_task = stop_app_on_container_task.delay(container['host'], container['container_name'], bind_path, app, app_files, "")
+        #if 'disk_path' in container: bind_path = container['disk_path']
+        if 'disk' in container['resources'] and 'path' in container['resources']['disk']: bind_path = container['resources']['disk']['path']
+        stop_task = stop_container.delay(container['host'], container['name'], bind_path)
         register_task(stop_task.id,"stop_container_task")
-        #stop_task = stop_app_on_container_task.si(container['host'], container['container_name'], bind_path, app, app_files, "")
-        #stop_containers_task.append(stop_task)
 
-    # TODO: Maybe collect some kind of logs...
     # It would be great to execute tasks on a group, but the group task ID is not trackable
-    #stop_group_task = group(stop_containers_task)()
-    #register_task(stop_group_task.id,"stop_containers_task")
 
     if len(errors) > 0: raise Exception(str(errors))
+
+@shared_task
+def remove_containers_from_app(url, container_list, app, app_files):
+
+    # Disable scaler and other scaling services before removing containers
+    with scaling_services_disabled():
+        change_app_state_in_db(url, app, "stopped")
+
+        # Desubscribe containers from app in StateDB
+        errors = []
+        for container in container_list:
+            full_url = url + "container/{0}/{1}".format(container['container_name'], app)
+            error = remove_container_from_app_db(full_url, container['container_name'], app)
+            if error != "":
+                errors.append(error)
+
+    ## Get timestamp to store output data
+    timestamp = None
+    if 'output_dir' in app_files and app_files['output_dir'] != '':
+        timestamp = time.strftime("%Y-%m-%d--%H-%M-%S")
+
+    # Stop app on containers
+    for container in container_list:
+        try:
+            run_playbooks.stop_app_on_container(container['host'], container['container_name'], app, app_files,
+                                                rm_container="", bind_path=container.get('disk_path', ''), timestamp=timestamp)
+        except Exception as e:
+            error_msg = "Error stopping aplication {0} inside container {1}: {2}".format(app, container['container_name'], str(e))
+            errors.append(error_msg)
+            print(error_msg)
+
+    # Stop containers on remote hosts and remove from inventory (best-effort, synchronous)
+    for container in container_list:
+        try:
+            stop_container(container['host'], container['container_name'], container.get('disk_path', ''))
+        except Exception as e:
+            errors.append(str(e)) # Error is already formatted inside stop_container
+            print(str(e))
+
+    if len(errors) > 0:
+        raise Exception(str(errors))
+
+@shared_task
+def remove_users_task(url, users):
+    with scaling_services_disabled():
+        errors = []
+        for user_name in users:
+            full_url = "{0}/{1}".format(url, user_name)
+            error_message = "Error removing user {0}".format(user_name)
+            error, _ = web_request(full_url, "delete", error_message)
+            if error != "":
+                errors.append(error)
+
+    if len(errors) > 0:
+        raise Exception(str(errors))
 
 def remove_container_from_db(full_url, container_name):
 
     # Remove container from DB
     error_message = "Error removing container {0}".format(container_name)
-    error, _ = request_to_state_db(full_url, "delete", error_message)
+    error, _ = web_request(full_url, "delete", error_message)
 
     return error
 
@@ -785,7 +1358,7 @@ def remove_container_from_app_db(full_url, container_name, app):
 
         # Remove container from app
         error_message = "Error removing container {0} from app {1}".format(container_name, app)
-        error, response = request_to_state_db(full_url, "delete", error_message)
+        error, response = web_request(full_url, "delete", error_message)
 
         if response != "":
             if not error: break
@@ -804,257 +1377,25 @@ def remove_container_from_app_db(full_url, container_name, app):
     return error
 
 @shared_task
-def stop_container(host, container_name):
-
-    ## Stop container
-    argument_list = [host, container_name]
-    error_message = "Error stopping container {0}".format(container_name)
-    process_script("stop_container", argument_list, error_message)
-
-    # update inventory file
-    with redis_server.lock(lock_key):
-        remove_container_from_host(container_name, host)
-
-@shared_task
-def stop_app_on_container_task(host, container_name, bind_path, app, app_files, rm_container):
-
-    ## Stop app on container
-    app_dir = app_files['app_dir']
-    files_dir = app_files['files_dir']
-    install_script = app_files['install_script']
-    start_script = app_files['start_script']
-    stop_script = app_files['stop_script']
-    app_jar = app_files['app_jar']
-
-    argument_list = [host, container_name, app, app_dir, files_dir, install_script, start_script, stop_script, app_jar, bind_path, rm_container]
-    error_message = "Error stopping app {0} on container {1}".format(app, container_name)
-    process_script("stop_app_on_container", argument_list, error_message)
-
-    stop_container(host, container_name)
-
-
-### Deprecated functions
-## Not used ATM
-#@shared_task
-def start_containers_task(host, new_containers, container_resources):
-
-    # update inventory file
-    with redis_server.lock(lock_key):
-        added_containers = add_containers_to_hosts(new_containers)
-
-    added_formatted_containers = container_list_to_formatted_str(added_containers[host])
-
-    if added_formatted_containers == "":
-        # Nothing to do
-        return
-
-    max_cpu_percentage_per_container = container_resources["cpu_max"]
-    min_cpu_percentage_per_container = container_resources["cpu_min"]
-    cpu_boundary = container_resources["cpu_boundary"]
-    max_memory_per_container = container_resources["mem_max"]
-    min_memory_per_container = container_resources["mem_min"]
-    mem_boundary = container_resources["mem_boundary"]
-
-    argument_list = [host, added_formatted_containers, max_cpu_percentage_per_container, min_cpu_percentage_per_container, cpu_boundary, max_memory_per_container, min_memory_per_container, mem_boundary]
-    error_message = "Error starting containers {0}".format(added_formatted_containers)
-    process_script("start_containers", argument_list, error_message)
-
-## Not used ATM
-#@shared_task
-def start_containers_with_app_task(already_added_containers, url, host, new_containers, app, app_files, container_resources):
-    #TODO: merge function with start_containers_task
-
-    if new_containers == 0:
-        # Nothing to do
-        return already_added_containers
-
-    # update inventory file
-    with redis_server.lock(lock_key):
-        added_containers = add_containers_to_hosts({host: new_containers})
-
-    added_formatted_containers = container_list_to_formatted_str(added_containers[host])
-
-    # Start containers
-    if app_files['install_script'] and app_files['install_script'] != "":
-        template_definition_file="app_container.def"
-        definition_file = "{0}_container.def".format(app.replace(" ", "_"))
-        image_file = "{0}_container.sif".format(app.replace(" ", "_"))
-    elif app_files['app_jar'] and app_files['app_jar'] != "":
-        template_definition_file="hadoop_container.def"
-        definition_file = "hadoop_container.def"
-        image_file = "hadoop_container.sif"
-    else:
-        template_definition_file="ubuntu_container.def"
-        definition_file = "ubuntu_container.def"
-        image_file = "ubuntu_container.sif"
-
-    max_cpu_percentage_per_container = container_resources["cpu_max"]
-    min_cpu_percentage_per_container = container_resources["cpu_min"]
-    cpu_boundary = container_resources["cpu_boundary"]
-    max_memory_per_container = container_resources["mem_max"]
-    min_memory_per_container = container_resources["mem_min"]
-    mem_boundary = container_resources["mem_boundary"]
-
-    argument_list = [host, app, template_definition_file, definition_file, image_file, app_files['files_dir'], app_files['install_script'], app_files['app_jar'], 
-        added_formatted_containers, max_cpu_percentage_per_container, min_cpu_percentage_per_container, cpu_boundary, max_memory_per_container, min_memory_per_container, mem_boundary]
-    error_message = "Error starting containers {0}".format(added_formatted_containers)
-    process_script("start_containers_with_app", argument_list, error_message)
-
-    return mergeDictionary(already_added_containers,added_containers)
-
-## Not used ATM
-def start_app(url, app, app_files, new_containers, container_resources, disk_assignation):
-
-    # TODO: setup network before starting app on containers -> first start containers (without starting app) then setup network and start app on the same task
-
-    setup_network_task = setup_containers_network_task.s(url, app, app_files)
-    start_containers_tasks = []
-
-    # Start containers with app
-    i = 0
-    for host in new_containers:
-        if "irregular" in new_containers[host]:
-            # Start a chain of tasks so that containers of same host are started sequentially
-            # tasks = chain(start_containers_with_app_task.si(url, host, new_containers[host]["irregular"], app, app_files, container_resources["irregular"]), start_containers_with_app_task.si(url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"])).apply_async()
-            # register_task(tasks.id,"start_containers_with_app_task")
-            # start_containers_tasks.append(chain(start_containers_with_app_task.si({},url, host, new_containers[host]["irregular"], app, app_files, container_resources["irregular"]), start_containers_with_app_task.s(url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"])))
-            if i == 0:
-                start_containers_tasks.append(chain(start_containers_with_app_task.s({},url, host, new_containers[host]["irregular"], app, app_files, container_resources["irregular"]), start_containers_with_app_task.s(url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"])))
-            else:
-                start_containers_tasks.append(chain(start_containers_with_app_task.s(url, host, new_containers[host]["irregular"], app, app_files, container_resources["irregular"]), start_containers_with_app_task.s(url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"])))
-
-        else:
-            # task = start_containers_with_app_task.delay(url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"])
-            # register_task(task.id,"start_containers_with_app_task")
-            # start_containers_tasks.append(start_containers_with_app_task.si({},url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"]))
-            if i == 0:
-                start_containers_tasks.append(start_containers_with_app_task.s({},url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"]))
-            else:
-                start_containers_tasks.append(start_containers_with_app_task.s(url, host, new_containers[host]["regular"], app, app_files, container_resources["regular"]))
-
-        i += 1
-
-    if len(start_containers_tasks) > 0:
-        #task = chord(start_containers_tasks)(setup_network_task)
-
-        start_containers_tasks.append(setup_network_task)
-        task = chain(*start_containers_tasks).delay()
-        register_task(task.id,"setup_containers_network_task")
-
-## Not used ATM
-def start_hadoop_app(url, app, app_files, new_containers, container_resources, disk_assignation):
-
-    # Calculate resources for Hadoop cluster
-    hadoop_resources = {}
-    for container_type in ["regular","irregular"]:
-        # NOTE: 'irregular' container won't be created due to a previous workaround
-        if container_type in container_resources:
-            hadoop_resources[container_type] = {}
-
-            total_cores = max(int(container_resources[container_type]["cpu_max"])//100,1)
-            min_cores = max(int(container_resources[container_type]["cpu_min"])//100,1)
-            total_memory = int(container_resources[container_type]["mem_max"])
-            total_disks = 1
-            reserved_memory = get_node_reserved_memory(total_memory)
-            available_memory = total_memory - reserved_memory
-            min_container_size = get_min_container_size(total_memory)
-
-            number_of_hadoop_containers = int(min(2*total_cores, 1.8*total_disks, available_memory/min_container_size))
-            mem_per_container = max(min_container_size, available_memory/number_of_hadoop_containers)
-
-            scheduler_maximum_memory = int(number_of_hadoop_containers * mem_per_container)
-            scheduler_minimum_memory = int(mem_per_container)
-            nodemanager_memory = scheduler_maximum_memory
-            map_memory = scheduler_minimum_memory
-            reduce_memory = int(min(2*mem_per_container, available_memory))
-            mapreduce_am_memory = reduce_memory
-
-            total_available_memory = 0
-            for host in new_containers:
-                if container_type in new_containers[host]:
-                    total_available_memory += available_memory * new_containers[host][container_type]
-
-            if total_available_memory < map_memory + reduce_memory + mapreduce_am_memory:
-                memory_slice = nodemanager_memory/3.5
-                scheduler_minimum_memory = int(memory_slice)
-                map_memory = scheduler_minimum_memory
-                reduce_memory = scheduler_minimum_memory
-                mapreduce_am_memory = int(1.5 * memory_slice)
-
-            map_memory_java_opts = int(0.8 * map_memory)
-            reduce_memory_java_opts = int(0.8 * reduce_memory)
-            mapreduce_am_memory_java_opts = int(0.8* mapreduce_am_memory)
-
-            hadoop_resources[container_type]["vcores"] = str(total_cores)
-            hadoop_resources[container_type]["min_vcores"] = str(min_cores)
-            hadoop_resources[container_type]["scheduler_maximum_memory"] = str(scheduler_maximum_memory)
-            hadoop_resources[container_type]["scheduler_minimum_memory"] = str(scheduler_minimum_memory)
-            hadoop_resources[container_type]["nodemanager_memory"] = str(nodemanager_memory)
-            hadoop_resources[container_type]["map_memory"] = str(map_memory)
-            hadoop_resources[container_type]["map_memory_java_opts"] = str(map_memory_java_opts)
-            hadoop_resources[container_type]["reduce_memory"] = str(reduce_memory)
-            hadoop_resources[container_type]["reduce_memory_java_opts"] = str(reduce_memory_java_opts)
-            hadoop_resources[container_type]["mapreduce_am_memory"] = str(mapreduce_am_memory)
-            hadoop_resources[container_type]["mapreduce_am_memory_java_opts"] = str(mapreduce_am_memory_java_opts)
-
-    start_time = timeit.default_timer()
-    setup_network_task = setup_containers_hadoop_network_task.s(url, app, app_files, hadoop_resources, new_containers, start_time)
-    start_containers_tasks = []
-
-    # Start containers with app
-    i = 0
-    for host in new_containers:
-        start_host_containers_taks = []
-
-        for container_type in ["rm-nn", "irregular", "regular"]:
-            # NOTE: 'irregular' container won't be created due to a previous workaround
-            if container_type in new_containers[host]:
-                if i == 0:
-                    start_host_containers_taks.append(start_containers_with_app_task.s({}, url, host, new_containers[host][container_type], app, app_files, container_resources[container_type]))
-                else:
-                    start_host_containers_taks.append(start_containers_with_app_task.s(url, host, new_containers[host][container_type], app, app_files, container_resources[container_type]))
-                i += 1
-
-        start_containers_tasks.append(chain(*start_host_containers_taks))
-
-    if len(start_containers_tasks) > 0:
-        start_containers_tasks.append(setup_network_task)
-        task = chain(*start_containers_tasks).delay()
-        register_task(task.id,"{0}_app_task".format(app))
-
-## Not used ATM
-#@shared_task
-def remove_container_task(full_url, host_name, cont_name):
-
-    error_message = "Error removing container {0}".format(cont_name)
-    error, _ = request_to_state_db(full_url, "delete", error_message)
-
-    ## stop container
-    if (error == ""):
-
-        argument_list = [host_name, cont_name]
-        error_message = "Error stopping container {0}".format(cont_name)
-        process_script("stop_container", argument_list, error_message)
-
+def stop_container(host, container_name, bind_path=None, clean_bind_dir=True):
+    error_msg = ""
+    try:
+        ## Stop container on remote host
+        run_playbooks.stop_container(host, container_name, bind_path, clean_bind_dir)
+    except Exception as e:
+        error_msg += "Error removing container {0} from remote host {1}: {2}".format(container_name, host, str(e))
+    try:
         # update inventory file
         with redis_server.lock(lock_key):
-            remove_container_from_host(cont_name,host_name)
-    else:
-        raise Exception(error)
+            remove_container_from_host(container_name, host)
+    except Exception as e:
+        error_msg += "\nError removing container {0} from inventory: {1}".format(container_name, str(e))
 
-## Not used ATM
-#@shared_task
-def remove_container_from_app_task(full_url, host, container_name, bind_path, app, app_files, rm_container):
+    if error_msg:
+        raise Exception(error_msg)
 
-    files_dir = app_files['files_dir']
-    install_script = app_files['install_script']
-    start_script = app_files['start_script']
-    stop_script = app_files['stop_script']
-    app_jar = app_files['app_jar']
 
-    argument_list = [host, container_name, app, files_dir, install_script, start_script, stop_script, app_jar, bind_path, rm_container]
-    error_message = "Error stopping app {0} on container {1}".format(app, container_name)
-    process_script("stop_app_on_container", argument_list, error_message)
-
-    # full_url[:full_url.rfind('/')] removes the last part of url -> .../container/host0-cont0/app1 -> .../container/host0-cont0
-    remove_container_task(full_url[:full_url.rfind('/')], host, container_name)
+@shared_task
+def stop_app_on_container_task(host, container_name, bind_path, app, app_files, rm_container, timestamp=None, download_time=0, upload_time=0):
+    run_playbooks.stop_app_on_container(host, container_name, app, app_files, rm_container, bind_path, timestamp, download_time, upload_time)
+    stop_container(host, container_name, bind_path)

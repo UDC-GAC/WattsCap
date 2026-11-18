@@ -14,30 +14,33 @@ class PlotStyler:
         for res in resource_config:
             resource_config[res]["ax"].tick_params(axis='both', labelsize=fontsize)
 
+    def __set_ax_ticks(self, ax, ax_name, default_limit):
+        limit = self.__config.get(f"HARD_{ax_name}_LIMIT", default_limit)
+        ticks_frequency = self.__config.get(f"{ax_name}_TICKS_FREQUENCY", round(limit / 10))
+        if ax_name == "X":
+            ax.set_xticks(PlotUtils.generate_ticks(limit, ticks_frequency))
+        else:
+            ax.set_yticks(PlotUtils.generate_ticks(limit, ticks_frequency))
+
     def set_ticks(self, resource_config, main_resource, xlim):
         # If configured set a custom X-axis scale defined by a tuple of functions (forward, inverse)
         # e.g., (lambda x: x**(1/2), lambda x: x**2)
-        if self.__config.get("CUSTOM_X_AXIS_FUNCTIONS", None):
-            resource_config[main_resource]["ax"].set_xscale('function', functions=self.__config.get("CUSTOM_X_AXIS_FUNCTIONS", None))
+        if self.__config.get("CUSTOM_X_AXIS_FUNCTION", None):
+            resource_config[main_resource]["ax"].set_xscale('function', functions=self.__config.get("CUSTOM_X_AXIS_FUNCTION", None))
         # If configured set a list of custom X ticks
         # e.g., [0, 50, 125, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250]
         if self.__config.get("CUSTOM_X_AXIS_VALUES", None):
             resource_config[main_resource]["ax"].set_xticks(self.__config.get("CUSTOM_X_AXIS_VALUES", None))
         else:
             # Generate X ticks based on X limit and X ticks frequency
-            resource_config[main_resource]["ax"].set_xticks(PlotUtils.generate_ticks(
-                self.__config.get("HARD_X_LIMIT", xlim), self.__config.get("X_TICKS_FREQUENCY", 20)))
+            self.__set_ax_ticks(resource_config[main_resource]["ax"], "X", xlim)
 
         # Set main resource y ticks
-        resource_config[main_resource]["ax"].set_yticks(PlotUtils.generate_ticks(
-            self.__config.get(f"HARD_{main_resource.upper()}_LIMIT", resource_config[main_resource]["limit"]),
-            self.__config.get(f"{main_resource.upper()}_TICKS_FREQUENCY", 20)))
+        self.__set_ax_ticks(resource_config[main_resource]["ax"], main_resource.upper(), resource_config[main_resource]["limit"])
 
         # If main resource is CPU and energy is included while axes have to be separated, set xticks for energy axis
         if main_resource == "cpu" and "energy" in resource_config and self.__config.get("SEPARATE_AXES", False):
-            resource_config["energy"]["ax"].set_yticks(
-                PlotUtils.generate_ticks(self.__config.get("HARD_ENERGY_LIMIT", resource_config["energy"]["limit"]),
-                                         self.__config.get("ENERGY_TICKS_FREQUENCY", 20)))
+            self.__set_ax_ticks(resource_config["energy"]["ax"], "ENERGY", resource_config["energy"]["limit"])
 
     def set_limits(self, resource_config, main_resource, xlim):
         # Set main resource limits

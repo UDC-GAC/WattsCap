@@ -15,7 +15,6 @@
     state: present
 
 - name: Install yq (non-root)
-  throttle: 1
   when: "not virtual_mode"
   pip:
     name:
@@ -23,21 +22,15 @@
     executable: pip3
 
 - name: Install pip dependencies
-  throttle: 1
   pip:
-    requirements: "{{ playbook_dir }}/services/requirements.txt"
+    requirements: "{{ services_dir }}/requirements.txt"
     executable: pip3
-
-- name: get the username running the deploy
-  become: no
-  local_action: command whoami
-  register: username_on_the_host
 
 - name: Copy Django secret key file
   copy:
-    src: config/django_secret_key.txt
+    src: "{{ config_dir }}/django_secret_key.txt"
     dest: "{{ installation_path }}/.django_secret_key.txt"
-    owner: "{{ username_on_the_host.stdout_lines[0] }}"
+    owner: "{{ user_info.user_name }}"
     mode: "0600"
 
 - name: Check for redis installation

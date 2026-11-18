@@ -1,0 +1,191 @@
+# Setup nodes
+- name: Start containers in hosts
+  hosts: nodes
+  become: no
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    - es_udc_gac.smart_sharedfs
+  module_defaults:
+    synchronize: "{{ global_module_defaults.synchronize }}"
+    es_udc_gac.smart_sharedfs.synchronize: "{{ global_module_defaults.synchronize }}"
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  environment:
+    BDWATCHDOG_PATH: "{{ bdwatchdog_path }}"
+    SERVERLESS_PATH: "{{ serverless_containers_path }}"
+    PYTHONPATH: "{{ bdwatchdog_path }}:{{ serverless_containers_path }}"
+
+  tasks:
+    - import_tasks: "{{ util_tasks }}/get_user_ids.yml"
+      tags: create_app, start_containers, setup_hdfs, build_tcp_tracker
+
+    ## Setup DNS for intra-container name resolution
+    - import_tasks: "{{ container_tasks }}/dns_launch.yml"
+      delegate_to: localhost
+      run_once: yes
+
+    - import_tasks: "{{ container_tasks }}/lxd_containers_setup.yml"
+      when: "container_engine == 'lxc'"
+      tags: start_containers
+      vars:
+        - lxd_key_name: "lxd-{{ inventory_hostname }}"
+
+    - name: Setup apptainer/singularity containers
+      when: "container_engine == 'apptainer'"
+      vars:
+        - app_type: "{{ 'generic_app' if install_script is defined and install_script != '' else 'base' }}"
+        - app_mapping:
+            base:
+              definition_file: ubuntu_container.def
+              image: ubuntu_container.sif
+            generic_app:
+              definition_file: generic_app.def
+              image: "{{ app_dir|basename + '.sif' if app_dir is defined }}"
+              install_extra_files: "{{ app_dir if app_dir is defined }}" # directory relative to ansible/provisioning/apps
+              image_dependency: base
+            hadoop_app:
+              definition_file: hadoop_app.def
+              image: hadoop_app.sif
+              install_extra_files: base/hadoop_app
+              image_dependency: base
+            spark_app:
+              definition_file: spark_app.def
+              image: spark_app.sif
+              image_dependency: hadoop_app
+            hdfs_frontend:
+              definition_file: hdfs_frontend.def
+              image: hdfs_frontend.sif
+              image_dependency: hadoop_app
+      block:
+        ## Image creation
+        - include_tasks: "{{ container_tasks }}/apptainer_container_image_setup.yml" # beware of the differences of 'include_tasks' vs 'import_tasks', such as tagging
+          loop: "{{ reverse_image_dependencies }}"
+          tags: create_app, setup_hdfs
+          vars:
+            - reverse_image_dependencies: > # for example, if app_type=spark_app, the resulting list will be ['base', 'hadoop_app', 'spark_app'] to build the images in order
+                  {%- set build_list = [] -%}
+                  {%- set ns = namespace(current_app_type=app_type) -%}
+                  {%- for _ in range(app_mapping | length) -%}
+                    {%- if ns.current_app_type is not none -%}
+                      {%- set _ = build_list.append(ns.current_app_type) -%}
+                      {%- set ns.current_app_type = app_mapping[ns.current_app_type]['image_dependency'] if 'image_dependency' in app_mapping[ns.current_app_type] else none -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                  {{ build_list | reverse }}
+
+        ## Container startup
+        - import_tasks: "{{ container_tasks }}/apptainer_containers_cgroups_{{ container_owner }}_owned_setup.yml"
+          vars:
+            - container_owner: root # 'root' or 'user'
+              # note: root is required at the moment to start containers with cgroups support on cgroups v1 and with specific network on both cgroups versions
+            - image_file: "{{ app_mapping[app_type]['image'] }}"
+            - installed_app_directory: "{{ images_build_dir }}/{{ app_dir|basename if app_type == 'generic_app' else app_type }}" # installation path of app on server
+            # Other config
+            - cgroups_file: "apptainer_containers_cgroup.toml"
+            - containers_info_str: >
+                  {%- set containers_info=[] -%}
+                  {%- for host in groups['nodes'] -%}
+                    {%- for container_name in hostvars[host].containers -%}
+                        {%- set container_info = dict() -%}
+                        {{ container_info.update({'container_name': container_name, 'host': host, 'cpu_max': max_cpu_percentage_per_container, 'cpu_min': min_cpu_percentage_per_container, 'mem_max': max_memory_per_container, 'mem_min': min_memory_per_container }) }}
+                        {%- if disk_capabilities and hostvars[host].disks|length > 0 -%}
+                          {%- if create_lvm -%}
+                            {%- set path = [hostvars[host].disks['lvm']['path'], bind_dir_name, container_name] | join('/') -%}
+                            {{ container_info.update( {'disk': 'lvm', 'disk_path': path} ) }}
+                          {%- else -%}
+                            {%- set first_disk = hostvars[host].disks | first -%}
+                            {%- set path = [hostvars[host].disks[first_disk]['path'], bind_dir_name, container_name] | join('/') -%}
+                            {{ container_info.update( {'disk': first_disk, 'disk_path': path} ) }}
+                          {%- endif -%}
+                          {{ container_info.update( {'disk_max': max_diskbw_per_container, 'disk_min': min_diskbw_per_container}) }}
+                        {%- endif -%}
+                        {%- if power_budgeting -%}
+                          {{ container_info.update({'energy_max': max_energy_per_container, 'energy_min': min_energy_per_container}) }}
+                        {%- endif -%}
+                        {{ containers_info.append(container_info) }}
+                    {%- endfor -%}
+                  {%- endfor -%}
+                  {{ containers_info }}
+            - containers_info: "{{ containers_info_str | replace('\n','') | replace(' ','') }}"
+            ## TODO: merge the "master_container" parameter with "rm_container" as they are both used for the same purpose
+            - master_container: "{{ (containers_info | first).container_name }}" # This container will act as RM/NM on distributed deployments with Hadoop/Spark
+
+        ## Launch global HDFS frontend container
+        - import_tasks: "{{ launch_tasks }}/global_hdfs_frontend_launch.yml"
+          when: global_hdfs
+          tags: never, setup_hdfs
+          vars:
+            frontend_port: 44444
+
+    - import_tasks: "{{ container_tasks }}/tcp_tracker_launch.yml"
+      when: disk_capabilities and disk_scaling and global_hdfs
+
+    - import_tasks: "{{ container_tasks }}/node_rescaler_launch.yml"
+
+    - import_tasks: "{{ container_tasks }}/manage_cache_containers.yml"
+      when: manage_cache_hosts
+      tags: never
+
+# Setup server (now that nodes have been initialized)
+- hosts: localhost
+  become: no
+  any_errors_fatal: yes
+  gather_facts: yes
+  gather_subset: ## prevent gathering all facts
+    - "mounts"
+  collections:
+    - es_udc_gac.smart_sharedfs
+  module_defaults:
+    synchronize: "{{ global_module_defaults.synchronize }}"
+    es_udc_gac.smart_sharedfs.synchronize: "{{ global_module_defaults.synchronize }}"
+
+  vars_files:
+    - paths.yml
+    - "{{ main_vars }}"
+    - "{{ defaults }}"
+    - "{{ main_config }}"
+
+  environment:
+    BDWATCHDOG_PATH: "{{ bdwatchdog_path }}"
+    SERVERLESS_PATH: "{{ serverless_containers_path }}"
+    PYTHONPATH: "{{ bdwatchdog_path }}:{{ serverless_containers_path }}"
+
+  tasks:
+    - import_tasks: "{{ util_tasks }}/get_user_ids.yml"
+      tags: start_couchdb, restart_services
+
+    - import_tasks: "{{ launch_tasks }}/couchdb_launch.yml"
+      tags: start_couchdb, restart_services
+
+    - import_tasks: "{{ container_tasks }}/node_rescaler_containers_init.yml"
+      tags: 
+        - start_containers
+        - init_node_rescaler
+      vars:
+        - nodes: "{{ host_list | split(',') if host_list is defined else groups['nodes'] }}"
+        - containers_info_str: >
+              {%- set containers_info=[] -%}
+              {%- for host in nodes -%}
+                {%- for container_name in hostvars[host].containers -%}
+                  {%- set container_info = dict() -%}
+                    {{ container_info.update({'container_name': container_name, 'host': host, 'cpu_max': max_cpu_percentage_per_container, 'cpu_min': min_cpu_percentage_per_container, 'mem_max': max_memory_per_container, 'mem_min': min_memory_per_container }) }}
+                    {%- if disk_capabilities and disk_scaling and hostvars[host].disks|length > 0 -%}
+                      {{ container_info.update( {'disk_read_max': max_disk_read_bw_per_container, 'disk_read_min': min_disk_read_bw_per_container, 'disk_write_max': max_disk_write_bw_per_container, 'disk_write_min': min_disk_write_bw_per_container}) }}
+                    {%- endif -%}
+                    {%- if power_budgeting -%}
+                      {{ container_info.update({'energy_max': max_energy_per_container, 'energy_min': min_energy_per_container}) }}
+                    {%- endif -%}                      
+                    {{ containers_info.append(container_info) }}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ containers_info }}
+        - resources: "{{ ['cpu', 'mem'] + (['disk'] if disk_capabilities and disk_scaling else []) + (['energy'] if power_budgeting else []) }}"
+        - containers_info: "{{ containers_info_str | replace('\n','') | replace(' ','') }}"
